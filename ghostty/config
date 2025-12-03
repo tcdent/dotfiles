@@ -27,8 +27,8 @@ palette = 13=c86ead
 palette = 14=6CAFBD
 palette = 15=FFFFFF
 
-window-padding-x = 0
-window-padding-y = 0
+window-padding-x = 5
+window-padding-y = 5
 window-theme = dark
 window-decoration = true
 

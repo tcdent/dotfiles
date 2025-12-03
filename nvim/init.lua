@@ -28,7 +28,24 @@ vim.keymap.set('n', '<leader>t', function()
   if vim.bo.filetype == 'neo-tree' then
     vim.cmd('wincmd p')  -- go to previous window
   end
-  vim.cmd('vsplit')
+  -- Find existing empty unnamed buffer
+  local empty_buf = nil
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf)
+      and vim.api.nvim_buf_get_name(buf) == ''
+      and vim.bo[buf].buftype == ''
+      and vim.api.nvim_buf_line_count(buf) == 1
+      and vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == '' then
+      empty_buf = buf
+      break
+    end
+  end
+  if empty_buf then
+    vim.cmd('rightbelow vsplit')
+    vim.api.nvim_set_current_buf(empty_buf)
+  else
+    vim.cmd('rightbelow vnew')
+  end
 end, { desc = 'New vertical split' })
 
 -- Buffer navigation (cycles through tabs at top)
@@ -42,8 +59,8 @@ vim.keymap.set('n', '<leader>fg', ':Telescope live_grep<CR>', { desc = 'Live gre
 vim.keymap.set('n', '<leader>fb', ':Telescope buffers<CR>', { desc = 'Browse buffers' })
 
 -- Git
-vim.keymap.set('n', '<leader>gd', ':DiffviewOpen<CR>', { desc = 'Git diff view' })
-vim.keymap.set('n', '<leader>gc', ':DiffviewClose<CR>', { desc = 'Close diff view' })
+vim.keymap.set('n', '<leader>d', ':DiffviewOpen<CR>', { desc = 'Git diff view' })
+vim.keymap.set('n', '<leader>D', ':DiffviewClose<CR>', { desc = 'Close diff view' })
 
 
 -- Auto-reload files changed outside Neovim

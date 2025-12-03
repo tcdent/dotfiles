@@ -21,8 +21,8 @@ Leader key is `Space`.
 - `Ctrl-w q` - Close window
 
 ### Git
-- `<leader>gd` - Open diff view
-- `<leader>gc` - Close diff view
+- `<leader>d` - Open diff view
+- `<leader>D` - Close diff view
 
 ### LSP (Python)
 - `gd` - Go to definition
