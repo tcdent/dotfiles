@@ -1,0 +1,250 @@
+-- Minimal Neovim Configuration
+-- Simple setup with file browser, syntax highlighting, and tabs
+
+-- Basic Settings
+vim.opt.number = true              -- Show line numbers
+--vim.opt.relativenumber = true      -- Relative line numbers
+vim.opt.ignorecase = true          -- Ignore case in search
+vim.opt.smartcase = true           -- Unless search has capitals
+vim.opt.hlsearch = false           -- Don't highlight searches
+vim.opt.wrap = false               -- Don't wrap lines
+vim.opt.tabstop = 4                -- Tab width
+vim.opt.shiftwidth = 4             -- Indent width
+vim.opt.expandtab = true           -- Use spaces instead of tabs
+vim.opt.fillchars:append({ diff = ' ' })  -- Use space instead of hyphens in diff
+vim.g.mapleader = ' '              -- Space as leader key
+
+-- Buffer/scroll position settings
+vim.opt.hidden = true              -- Keep buffers loaded in background
+vim.opt.laststatus = 0             -- Disable bottom statusline (using winbar instead)
+vim.opt.scrolloff = 20             -- Keep lines visible above/below cursor
+
+-- Key Mappings
+vim.keymap.set('n', '<leader>e', ':Neotree toggle<CR>', { desc = 'Toggle file browser' })
+vim.keymap.set('n', '<leader>w', '<C-w>', { desc = 'Window commands' })
+
+-- Window/Split management
+vim.keymap.set('n', '<leader>t', function()
+  if vim.bo.filetype == 'neo-tree' then
+    vim.cmd('wincmd p')  -- go to previous window
+  end
+  vim.cmd('vsplit')
+end, { desc = 'New vertical split' })
+
+-- Buffer navigation (cycles through tabs at top)
+vim.keymap.set('n', '<leader>]', ':BufferLineCycleNext<CR>', { desc = 'Next buffer' })
+vim.keymap.set('n', '<leader>[', ':BufferLineCyclePrev<CR>', { desc = 'Previous buffer' })
+vim.keymap.set('n', '<leader>x', ':bdelete<CR>', { desc = 'Close buffer' })
+
+-- Telescope (fuzzy finder)
+vim.keymap.set('n', '<leader>ff', ':Telescope find_files<CR>', { desc = 'Find files' })
+vim.keymap.set('n', '<leader>fg', ':Telescope live_grep<CR>', { desc = 'Live grep' })
+vim.keymap.set('n', '<leader>fb', ':Telescope buffers<CR>', { desc = 'Browse buffers' })
+
+-- Git
+vim.keymap.set('n', '<leader>gd', ':DiffviewOpen<CR>', { desc = 'Git diff view' })
+vim.keymap.set('n', '<leader>gc', ':DiffviewClose<CR>', { desc = 'Close diff view' })
+
+
+-- Auto-reload files changed outside Neovim
+vim.opt.autoread = true            -- Auto-reload files when changed externally
+vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter", "CursorHold" }, {
+  callback = function()
+    vim.cmd("checktime")
+  end,
+})
+
+-- Bootstrap lazy.nvim plugin manager
+local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
+if not vim.loop.fs_stat(lazypath) then
+  vim.fn.system({
+    "git",
+    "clone",
+    "--filter=blob:none",
+    "https://github.com/folke/lazy.nvim.git",
+    "--branch=stable",
+    lazypath,
+  })
+end
+vim.opt.rtp:prepend(lazypath)
+
+-- Plugin Setup
+require("lazy").setup({
+
+  -- Status line (at top of each window)
+  {
+    "nvim-lualine/lualine.nvim",
+    dependencies = { "nvim-tree/nvim-web-devicons" },
+    config = function()
+      require("lualine").setup({
+        options = {
+          theme = 'auto',
+        },
+        sections = {}, -- disable bottom
+        inactive_sections = {},  -- hide bottom container
+        winbar = {
+          lualine_a = { 'mode' },
+          lualine_b = { 'branch', 'diff' },
+          lualine_c = { 'filename' },
+          lualine_x = { 'filetype' },
+          lualine_y = { 'progress' },
+          lualine_z = { 'location' },
+        },
+      })
+    end,
+  },
+
+  -- File browser
+  {
+    "nvim-neo-tree/neo-tree.nvim",
+    dependencies = {
+      "nvim-lua/plenary.nvim",
+      "nvim-tree/nvim-web-devicons",
+      "MunifTanjim/nui.nvim",
+    },
+    config = function()
+      require("neo-tree").setup({
+        close_if_last_window = false,
+        open_files_do_not_replace_types = { "terminal", "trouble", "qf" },
+        window = {
+          position = "right",
+          width = 30,
+          mapping_options = {
+            noremap = true,
+            nowait = true,
+          },
+        },
+        filesystem = {
+          follow_current_file = {
+            enabled = true,
+          },
+          filtered_items = {
+            hide_dotfiles = false,
+            hide_gitignored = false,
+          },
+        },
+      })
+    end,
+  },
+
+  -- Syntax highlighting
+  {
+    "nvim-treesitter/nvim-treesitter",
+    build = ":TSUpdate",
+    config = function()
+      require("nvim-treesitter.configs").setup({
+        ensure_installed = { "lua", "vim", "python", "javascript", "typescript", "json", "yaml" },
+        auto_install = true,
+        highlight = {
+          enable = true,
+        },
+      })
+    end,
+  },
+
+  -- Buffer tabs at the top
+  {
+    "akinsho/bufferline.nvim",
+    dependencies = { "nvim-tree/nvim-web-devicons" },
+    config = function()
+      require("bufferline").setup({
+        options = {
+          separator_style = "thin",
+          always_show_bufferline = true,
+          offsets = {
+            { filetype = "neo-tree", text = "Files", highlight = "Directory", separator = true },
+          },
+        },
+      })
+    end,
+  },
+
+  -- Claude Code MCP integration (WebSocket server like VS Code)
+  {
+    "coder/claudecode.nvim",
+    config = function()
+      require("claudecode").setup({})
+    end,
+  },
+
+  -- GitHub Copilot
+  {
+    "github/copilot.vim",
+  },
+
+  -- Fuzzy finder
+  {
+    "nvim-telescope/telescope.nvim",
+    dependencies = { "nvim-lua/plenary.nvim" },
+    config = function()
+      require("telescope").setup({})
+    end,
+  },
+
+  -- Markdown rendering in-editor
+  {
+    "MeanderingProgrammer/render-markdown.nvim",
+    dependencies = { "nvim-treesitter/nvim-treesitter", "nvim-tree/nvim-web-devicons" },
+    ft = { "markdown" },
+    config = function()
+      require("render-markdown").setup({})
+      -- Reapply colorscheme so our highlights take precedence
+      vim.cmd.colorscheme('slomp')
+    end,
+  },
+
+  -- LSP server configs (provides definitions for vim.lsp.enable)
+  { "neovim/nvim-lspconfig" },
+
+  -- Git diff viewer
+  {
+    "sindrets/diffview.nvim",
+    dependencies = { "nvim-lua/plenary.nvim" },
+    config = function()
+      require("diffview").setup({})
+    end,
+  },
+})
+
+-- Load SLOMP colorscheme (after plugins so our highlights take precedence)
+vim.cmd.colorscheme('slomp')
+
+-- Prevent horizontal scrolling in neo-tree
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "neo-tree",
+  callback = function()
+    vim.opt_local.sidescrolloff = 0
+    vim.api.nvim_create_autocmd("CursorMoved", {
+      buffer = 0,
+      callback = function()
+        vim.cmd("norm! 0")
+      end,
+    })
+  end,
+})
+
+-- Markdown settings (wrap for prose)
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "markdown",
+  callback = function()
+    vim.opt_local.wrap = true
+    vim.opt_local.linebreak = true  -- wrap at word boundaries
+  end,
+})
+
+-- LSP setup (Neovim 0.11+ native)
+vim.lsp.enable('pyright')
+
+-- LSP keybindings (only active when LSP attaches)
+vim.api.nvim_create_autocmd("LspAttach", {
+  callback = function(args)
+    local opts = { buffer = args.buf }
+    vim.keymap.set('n', 'gd', vim.lsp.buf.definition, opts)
+    vim.keymap.set('n', 'gr', vim.lsp.buf.references, opts)
+    vim.keymap.set('n', 'K', vim.lsp.buf.hover, opts)
+    vim.keymap.set('n', '<leader>rn', vim.lsp.buf.rename, opts)
+  end,
+})
+
+-- Load language-specific configs
+require("config.hooks")

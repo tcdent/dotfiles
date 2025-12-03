@@ -1,0 +1,8 @@
+#!/bin/zsh
+socket="/tmp/nvim-$(tmux display -p '#S').sock"
+if [[ -S "$socket" ]]; then
+  nvr --servername "$socket" --remote-wait "$@"
+else
+  echo "No nvim socket found at $socket"
+  nvim "$@"
+fi

@@ -1,0 +1,16 @@
+# Ignore everything
+*
+
+# But track these directories
+!bin/
+!bin/**
+!ghostty/
+!ghostty/**
+!nvim/
+!nvim/**
+!tmux/
+!tmux/**
+
+# And these files
+!.gitignore
+!README.md

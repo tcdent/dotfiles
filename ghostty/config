@@ -1,0 +1,37 @@
+font-family = Menlo
+font-size = 12
+theme = Dark+
+
+background = 1E1E1E
+foreground = D4D4D4
+cursor-color = c86ead
+cursor-text = 1E1E1E
+selection-background = 0c363f
+selection-foreground = D4D4D4
+
+palette = 0=1E1E1E
+palette = 1=D65A77
+palette = 2=bd9a6e
+palette = 3=ca9bbc
+palette = 4=6774AF
+palette = 5=c86ead
+palette = 6=6CAFBD
+palette = 7=D4D4D4
+
+palette = 8=808080
+palette = 9=D65A77
+palette = 10=bd9a6e
+palette = 11=bd9a6e
+palette = 12=a41e6a
+palette = 13=c86ead
+palette = 14=6CAFBD
+palette = 15=FFFFFF
+
+window-padding-x = 0
+window-padding-y = 0
+window-theme = dark
+window-decoration = true
+
+cursor-style = block
+cursor-style-blink = true
+keybind = shift+enter=text:\x1b\r
