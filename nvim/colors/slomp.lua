@@ -17,8 +17,10 @@ end
 -- UI Colors
 hi('Normal', { fg = '#dd7a9f', bg = '#1E1E1E' })
 hi('NormalFloat', { bg = '#1E1E1E' })
-hi('CursorLine', { bg = '#1a1a1a' })
-hi('CursorLineNr', { fg = '#c86ead', bg = '#1a1a1a' })
+hi('CursorLine', { bg = '#2a2a2a' })
+hi('CursorLineNr', { fg = '#c86ead', bg = '#2a2a2a' })
+hi('ColorColumn', { bg = '#212121' })
+hi('Whitespace', { fg = '#3a3a3a' })
 hi('LineNr', { fg = '#6774AF' })
 hi('SignColumn', { bg = '#1E1E1E' })
 hi('VertSplit', { fg = '#a86e9a' })
@@ -167,3 +169,14 @@ vim.g.terminal_color_12 = '#a41e6a'  -- bright blue
 vim.g.terminal_color_13 = '#c86ead'  -- bright magenta
 vim.g.terminal_color_14 = '#6CAFBD'  -- bright cyan
 vim.g.terminal_color_15 = '#dd7a9f'  -- bright white
+
+-- Bufferline (tab bar)
+hi('BufferLineBufferSelected', { fg = '#FFFFFF', bg = '#2a2a2a', bold = true })
+hi('BufferLineIndicatorSelected', { fg = '#c86ead', bg = '#2a2a2a' })
+hi('BufferLineBuffer', { fg = '#808080', bg = '#1E1E1E' })
+hi('BufferLineBackground', { fg = '#808080', bg = '#1E1E1E' })
+hi('BufferLineModified', { fg = '#bd9a6e', bg = '#1E1E1E' })
+hi('BufferLineModifiedSelected', { fg = '#bd9a6e', bg = '#2a2a2a' })
+hi('BufferLineFill', { bg = '#161616' })
+hi('BufferLineSeparator', { fg = '#161616', bg = '#1E1E1E' })
+hi('BufferLineSeparatorSelected', { fg = '#161616', bg = '#2a2a2a' })

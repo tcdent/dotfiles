@@ -18,6 +18,26 @@ vim.g.mapleader = ' '              -- Space as leader key
 vim.opt.hidden = true              -- Keep buffers loaded in background
 vim.opt.laststatus = 0             -- Disable bottom statusline (using winbar instead)
 vim.opt.scrolloff = 20             -- Keep lines visible above/below cursor
+vim.opt.cursorline = true          -- Highlight current line
+vim.opt.colorcolumn = "80,110"     -- Column guides
+vim.opt.list = true                -- Show whitespace
+vim.opt.listchars = { space = '·', tab = '→ ', trail = '·' }
+
+-- Click on inactive window focuses without viewport jumping
+vim.keymap.set('n', '<LeftMouse>', function()
+  local mouse = vim.fn.getmousepos()
+  local current_win = vim.api.nvim_get_current_win()
+  if mouse.winid ~= current_win and mouse.winid ~= 0 then
+    -- Move cursor to clicked position so viewport doesn't snap back
+    vim.api.nvim_set_current_win(mouse.winid)
+    local pos = { mouse.line, mouse.column - 1 }
+    pcall(vim.api.nvim_win_set_cursor, mouse.winid, pos)
+  else
+    -- Normal click behavior in current window
+    local pos = { mouse.line, mouse.column - 1 }
+    vim.api.nvim_win_set_cursor(0, pos)
+  end
+end)
 
 -- Key Mappings
 vim.keymap.set('n', '<leader>e', ':Neotree toggle<CR>', { desc = 'Toggle file browser' })
@@ -62,6 +82,9 @@ vim.keymap.set('n', '<leader>fb', ':Telescope buffers<CR>', { desc = 'Browse buf
 vim.keymap.set('n', '<leader>d', ':DiffviewOpen<CR>', { desc = 'Git diff view' })
 vim.keymap.set('n', '<leader>D', ':DiffviewClose<CR>', { desc = 'Close diff view' })
 
+-- Diagnostics
+vim.keymap.set('n', '<leader>l', vim.diagnostic.open_float, { desc = 'Show diagnostic' })
+
 
 -- Auto-reload files changed outside Neovim
 vim.opt.autoread = true            -- Auto-reload files when changed externally
@@ -93,9 +116,34 @@ require("lazy").setup({
     "nvim-lualine/lualine.nvim",
     dependencies = { "nvim-tree/nvim-web-devicons" },
     config = function()
+      local custom_theme = {
+        normal = {
+          a = { fg = '#1E1E1E', bg = '#c86ead', gui = 'bold' },
+          b = { fg = '#D4D4D4', bg = '#2c2c2c' },
+          c = { fg = '#D4D4D4', bg = '#1E1E1E' },
+          z = { fg = '#1E1E1E', bg = '#c86ead' },
+        },
+        insert = {
+          a = { fg = '#1E1E1E', bg = '#bd9a6e', gui = 'bold' },
+          z = { fg = '#1E1E1E', bg = '#bd9a6e' },
+        },
+        visual = {
+          a = { fg = '#1E1E1E', bg = '#6CAFBD', gui = 'bold' },
+          z = { fg = '#1E1E1E', bg = '#6CAFBD' },
+        },
+        replace = {
+          a = { fg = '#1E1E1E', bg = '#D65A77', gui = 'bold' },
+          z = { fg = '#1E1E1E', bg = '#D65A77' },
+        },
+        inactive = {
+          a = { fg = '#808080', bg = '#1E1E1E' },
+          b = { fg = '#808080', bg = '#1E1E1E' },
+          c = { fg = '#808080', bg = '#1E1E1E' },
+        },
+      }
       require("lualine").setup({
         options = {
-          theme = 'auto',
+          theme = custom_theme,
         },
         sections = {}, -- disable bottom
         inactive_sections = {},  -- hide bottom container
@@ -106,6 +154,10 @@ require("lazy").setup({
           lualine_x = { 'filetype' },
           lualine_y = { 'progress' },
           lualine_z = { 'location' },
+        },
+        inactive_winbar = {
+          lualine_c = { 'filename' },
+          lualine_x = { 'filetype' },
         },
       })
     end,
@@ -230,13 +282,14 @@ vim.cmd.colorscheme('slomp')
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "neo-tree",
   callback = function()
-    vim.opt_local.sidescrolloff = 0
-    vim.api.nvim_create_autocmd("CursorMoved", {
-      buffer = 0,
-      callback = function()
-        vim.cmd("norm! 0")
-      end,
-    })
+    vim.opt_local.wrap = true
+    -- Disable horizontal scroll keys
+    vim.keymap.set('n', 'zl', '<Nop>', { buffer = true })
+    vim.keymap.set('n', 'zh', '<Nop>', { buffer = true })
+    vim.keymap.set('n', 'zL', '<Nop>', { buffer = true })
+    vim.keymap.set('n', 'zH', '<Nop>', { buffer = true })
+    vim.keymap.set('n', '<ScrollWheelLeft>', '<Nop>', { buffer = true })
+    vim.keymap.set('n', '<ScrollWheelRight>', '<Nop>', { buffer = true })
   end,
 })
 
@@ -250,6 +303,14 @@ vim.api.nvim_create_autocmd("FileType", {
 })
 
 -- LSP setup (Neovim 0.11+ native)
+vim.lsp.config('pyright', {
+  settings = {
+    python = {
+      venvPath = ".",
+      venv = ".venv",
+    },
+  },
+})
 vim.lsp.enable('pyright')
 
 -- LSP keybindings (only active when LSP attaches)

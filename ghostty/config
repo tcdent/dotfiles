@@ -35,3 +35,5 @@ window-decoration = true
 cursor-style = block
 cursor-style-blink = true
 keybind = shift+enter=text:\x1b\r
+
+mouse-scroll-multiplier = 0.5
