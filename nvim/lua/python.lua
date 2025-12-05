@@ -1,18 +1,15 @@
--- Hooks that are called on specific events. 
+-- Python-specific configuration
 
--- Save and restore cursor/scroll position when switching buffers
-vim.api.nvim_create_autocmd("BufLeave", {
-  callback = function()
-    vim.cmd("silent! mkview")
-  end,
+-- LSP setup (Neovim 0.11+ native)
+vim.lsp.config('pyright', {
+  settings = {
+    python = {
+      venvPath = ".",
+      venv = ".venv",
+    },
+  },
 })
-
-vim.api.nvim_create_autocmd("BufEnter", {
-  callback = function()
-    vim.cmd("silent! loadview")
-  end,
-})
-
+vim.lsp.enable('pyright')
 
 -- Format with ruff on save
 vim.api.nvim_create_autocmd("BufWritePost", {

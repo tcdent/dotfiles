@@ -1,5 +1,8 @@
--- Minimal Neovim Configuration
--- Simple setup with file browser, syntax highlighting, and tabs
+local buffers = require("buffers")
+require("hooks")
+require("python")
+require("markdown")
+require("neotree")
 
 -- Basic Settings
 vim.opt.number = true              -- Show line numbers
@@ -22,22 +25,10 @@ vim.opt.cursorline = true          -- Highlight current line
 vim.opt.colorcolumn = "80,110"     -- Column guides
 vim.opt.list = true                -- Show whitespace
 vim.opt.listchars = { space = '·', tab = '→ ', trail = '·' }
+vim.opt.autoread = true            -- Auto-reload files when changed externally
 
 -- Click on inactive window focuses without viewport jumping
-vim.keymap.set('n', '<LeftMouse>', function()
-  local mouse = vim.fn.getmousepos()
-  local current_win = vim.api.nvim_get_current_win()
-  if mouse.winid ~= current_win and mouse.winid ~= 0 then
-    -- Move cursor to clicked position so viewport doesn't snap back
-    vim.api.nvim_set_current_win(mouse.winid)
-    local pos = { mouse.line, mouse.column - 1 }
-    pcall(vim.api.nvim_win_set_cursor, mouse.winid, pos)
-  else
-    -- Normal click behavior in current window
-    local pos = { mouse.line, mouse.column - 1 }
-    vim.api.nvim_win_set_cursor(0, pos)
-  end
-end)
+vim.keymap.set('n', '<LeftMouse>', buffers.handle_mouse_click)
 
 -- Key Mappings
 vim.keymap.set('n', '<leader>e', ':Neotree toggle<CR>', { desc = 'Toggle file browser' })
@@ -48,24 +39,8 @@ vim.keymap.set('n', '<leader>t', function()
   if vim.bo.filetype == 'neo-tree' then
     vim.cmd('wincmd p')  -- go to previous window
   end
-  -- Find existing empty unnamed buffer
-  local empty_buf = nil
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_loaded(buf)
-      and vim.api.nvim_buf_get_name(buf) == ''
-      and vim.bo[buf].buftype == ''
-      and vim.api.nvim_buf_line_count(buf) == 1
-      and vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == '' then
-      empty_buf = buf
-      break
-    end
-  end
-  if empty_buf then
-    vim.cmd('rightbelow vsplit')
-    vim.api.nvim_set_current_buf(empty_buf)
-  else
-    vim.cmd('rightbelow vnew')
-  end
+  vim.cmd('rightbelow vsplit')
+  vim.api.nvim_set_current_buf(buffers.get_or_create_empty())
 end, { desc = 'New vertical split' })
 
 -- Buffer navigation (cycles through tabs at top)
@@ -85,9 +60,14 @@ vim.keymap.set('n', '<leader>D', ':DiffviewClose<CR>', { desc = 'Close diff view
 -- Diagnostics
 vim.keymap.set('n', '<leader>l', vim.diagnostic.open_float, { desc = 'Show diagnostic' })
 
+-- LSP
+vim.keymap.set('n', 'gd', vim.lsp.buf.definition, { desc = 'Go to definition' })
+vim.keymap.set('n', 'gr', vim.lsp.buf.references, { desc = 'Find references' })
+vim.keymap.set('n', 'K', vim.lsp.buf.hover, { desc = 'Hover docs' })
+vim.keymap.set('n', '<leader>rn', vim.lsp.buf.rename, { desc = 'Rename symbol' })
+
 
 -- Auto-reload files changed outside Neovim
-vim.opt.autoread = true            -- Auto-reload files when changed externally
 vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter", "CursorHold" }, {
   callback = function()
     vim.cmd("checktime")
@@ -108,6 +88,9 @@ if not vim.loop.fs_stat(lazypath) then
 end
 vim.opt.rtp:prepend(lazypath)
 
+-- Load colorscheme before plugins so colors are available
+vim.cmd.colorscheme('slomp')
+
 -- Plugin Setup
 require("lazy").setup({
 
@@ -116,34 +99,9 @@ require("lazy").setup({
     "nvim-lualine/lualine.nvim",
     dependencies = { "nvim-tree/nvim-web-devicons" },
     config = function()
-      local custom_theme = {
-        normal = {
-          a = { fg = '#1E1E1E', bg = '#c86ead', gui = 'bold' },
-          b = { fg = '#D4D4D4', bg = '#2c2c2c' },
-          c = { fg = '#D4D4D4', bg = '#1E1E1E' },
-          z = { fg = '#1E1E1E', bg = '#c86ead' },
-        },
-        insert = {
-          a = { fg = '#1E1E1E', bg = '#bd9a6e', gui = 'bold' },
-          z = { fg = '#1E1E1E', bg = '#bd9a6e' },
-        },
-        visual = {
-          a = { fg = '#1E1E1E', bg = '#6CAFBD', gui = 'bold' },
-          z = { fg = '#1E1E1E', bg = '#6CAFBD' },
-        },
-        replace = {
-          a = { fg = '#1E1E1E', bg = '#D65A77', gui = 'bold' },
-          z = { fg = '#1E1E1E', bg = '#D65A77' },
-        },
-        inactive = {
-          a = { fg = '#808080', bg = '#1E1E1E' },
-          b = { fg = '#808080', bg = '#1E1E1E' },
-          c = { fg = '#808080', bg = '#1E1E1E' },
-        },
-      }
       require("lualine").setup({
         options = {
-          theme = custom_theme,
+          theme = _G.slomp_colors.lualine,
         },
         sections = {}, -- disable bottom
         inactive_sections = {},  -- hide bottom container
@@ -228,7 +186,7 @@ require("lazy").setup({
     end,
   },
 
-  -- Claude Code MCP integration (WebSocket server like VS Code)
+  -- Claude Code MCP integration
   {
     "coder/claudecode.nvim",
     config = function()
@@ -254,11 +212,8 @@ require("lazy").setup({
   {
     "MeanderingProgrammer/render-markdown.nvim",
     dependencies = { "nvim-treesitter/nvim-treesitter", "nvim-tree/nvim-web-devicons" },
-    ft = { "markdown" },
     config = function()
       require("render-markdown").setup({})
-      -- Reapply colorscheme so our highlights take precedence
-      vim.cmd.colorscheme('slomp')
     end,
   },
 
@@ -274,55 +229,3 @@ require("lazy").setup({
     end,
   },
 })
-
--- Load SLOMP colorscheme (after plugins so our highlights take precedence)
-vim.cmd.colorscheme('slomp')
-
--- Prevent horizontal scrolling in neo-tree
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "neo-tree",
-  callback = function()
-    vim.opt_local.wrap = true
-    -- Disable horizontal scroll keys
-    vim.keymap.set('n', 'zl', '<Nop>', { buffer = true })
-    vim.keymap.set('n', 'zh', '<Nop>', { buffer = true })
-    vim.keymap.set('n', 'zL', '<Nop>', { buffer = true })
-    vim.keymap.set('n', 'zH', '<Nop>', { buffer = true })
-    vim.keymap.set('n', '<ScrollWheelLeft>', '<Nop>', { buffer = true })
-    vim.keymap.set('n', '<ScrollWheelRight>', '<Nop>', { buffer = true })
-  end,
-})
-
--- Markdown settings (wrap for prose)
-vim.api.nvim_create_autocmd("FileType", {
-  pattern = "markdown",
-  callback = function()
-    vim.opt_local.wrap = true
-    vim.opt_local.linebreak = true  -- wrap at word boundaries
-  end,
-})
-
--- LSP setup (Neovim 0.11+ native)
-vim.lsp.config('pyright', {
-  settings = {
-    python = {
-      venvPath = ".",
-      venv = ".venv",
-    },
-  },
-})
-vim.lsp.enable('pyright')
-
--- LSP keybindings (only active when LSP attaches)
-vim.api.nvim_create_autocmd("LspAttach", {
-  callback = function(args)
-    local opts = { buffer = args.buf }
-    vim.keymap.set('n', 'gd', vim.lsp.buf.definition, opts)
-    vim.keymap.set('n', 'gr', vim.lsp.buf.references, opts)
-    vim.keymap.set('n', 'K', vim.lsp.buf.hover, opts)
-    vim.keymap.set('n', '<leader>rn', vim.lsp.buf.rename, opts)
-  end,
-})
-
--- Load language-specific configs
-require("config.hooks")

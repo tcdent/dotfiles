@@ -9,13 +9,65 @@ end
 vim.g.colors_name = 'slomp'
 vim.o.background = 'dark'
 
+-- Color palette (accessible via _G.slomp_colors)
+local c = {
+  bg = '#1E1E1E',
+  bg_light = '#2a2a2a',
+  bg_lighter = '#2c2c2c',
+  bg_dark = '#1a1a1a',
+  bg_darker = '#161616',
+  fg = '#dd7a9f',
+  fg_light = '#D4D4D4',
+  fg_dim = '#808080',
+  magenta = '#c86ead',
+  pink = '#ca9bbc',
+  rose = '#df9acb',
+  red = '#D65A77',
+  gold = '#bd9a6e',
+  orange = '#b78b67',
+  green = '#9eb882',
+  cyan = '#6CAFBD',
+  blue = '#6774AF',
+  purple = '#90618e',
+  violet = '#5f5db4',
+}
+
+-- Lualine theme
+c.lualine = {
+  normal = {
+    a = { fg = c.bg, bg = c.magenta, gui = 'bold' },
+    b = { fg = c.fg_light, bg = c.bg_lighter },
+    c = { fg = c.fg_light, bg = c.bg },
+    z = { fg = c.bg, bg = c.magenta },
+  },
+  insert = {
+    a = { fg = c.bg, bg = c.gold, gui = 'bold' },
+    z = { fg = c.bg, bg = c.gold },
+  },
+  visual = {
+    a = { fg = c.bg, bg = c.cyan, gui = 'bold' },
+    z = { fg = c.bg, bg = c.cyan },
+  },
+  replace = {
+    a = { fg = c.bg, bg = c.red, gui = 'bold' },
+    z = { fg = c.bg, bg = c.red },
+  },
+  inactive = {
+    a = { fg = c.fg_dim, bg = c.bg },
+    b = { fg = c.fg_dim, bg = c.bg },
+    c = { fg = c.fg_dim, bg = c.bg },
+  },
+}
+
+_G.slomp_colors = c
+
 -- Helper function to set highlights
 local function hi(group, opts)
   vim.api.nvim_set_hl(0, group, opts)
 end
 
 -- UI Colors
-hi('Normal', { fg = '#dd7a9f', bg = '#1E1E1E' })
+hi('Normal', { fg = c.fg, bg = c.bg })
 hi('NormalFloat', { bg = '#1E1E1E' })
 hi('CursorLine', { bg = '#2a2a2a' })
 hi('CursorLineNr', { fg = '#c86ead', bg = '#2a2a2a' })
