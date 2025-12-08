@@ -1,15 +1,31 @@
 -- Python-specific configuration
 
+-- Refresh LSP diagnostics when regaining focus (for external edits)
+vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter" }, {
+  pattern = "*.py",
+  callback = function()
+    vim.defer_fn(function()
+      for _, client in pairs(vim.lsp.get_clients({ bufnr = 0 })) do
+        client.notify("textDocument/didSave", {
+          textDocument = { uri = vim.uri_from_bufnr(0) }
+        })
+      end
+    end, 100)
+  end,
+})
+
 -- LSP setup (Neovim 0.11+ native)
-vim.lsp.config('pyright', {
+vim.lsp.config('ty', {
   settings = {
-    python = {
-      venvPath = ".",
-      venv = ".venv",
+    ty = {
+      diagnosticMode = 'openFilesOnly',
     },
   },
+  on_attach = function(client)
+    client.server_capabilities.semanticTokensProvider = nil
+  end,
 })
-vim.lsp.enable('pyright')
+vim.lsp.enable('ty')
 
 -- Format with ruff on save
 vim.api.nvim_create_autocmd("BufWritePost", {

@@ -26,6 +26,7 @@ vim.opt.colorcolumn = "80,110"     -- Column guides
 vim.opt.list = true                -- Show whitespace
 vim.opt.listchars = { space = '·', tab = '→ ', trail = '·' }
 vim.opt.autoread = true            -- Auto-reload files when changed externally
+vim.opt.whichwrap:append("<,>,h,l,[,]")  -- Wrap cursor to next/prev line
 
 -- Click on inactive window focuses without viewport jumping
 vim.keymap.set('n', '<LeftMouse>', buffers.handle_mouse_click)
@@ -37,16 +38,38 @@ vim.keymap.set('n', '<leader>w', '<C-w>', { desc = 'Window commands' })
 -- Window/Split management
 vim.keymap.set('n', '<leader>t', function()
   if vim.bo.filetype == 'neo-tree' then
-    vim.cmd('wincmd p')  -- go to previous window
+    vim.cmd('wincmd p')
   end
   vim.cmd('rightbelow vsplit')
   vim.api.nvim_set_current_buf(buffers.get_or_create_empty())
-end, { desc = 'New vertical split' })
+end, { desc = 'New split right' })
+
+vim.keymap.set('n', '<leader>T', function()
+  if vim.bo.filetype == 'neo-tree' then
+    vim.cmd('wincmd p')
+  end
+  vim.cmd('leftabove vsplit')
+  vim.api.nvim_set_current_buf(buffers.get_or_create_empty())
+end, { desc = 'New split left' })
+
+vim.keymap.set('n', '<leader>n', function()
+  vim.api.nvim_set_current_buf(buffers.get_or_create_empty())
+end, { desc = 'New/empty buffer' })
 
 -- Buffer navigation (cycles through tabs at top)
 vim.keymap.set('n', '<leader>]', ':BufferLineCycleNext<CR>', { desc = 'Next buffer' })
 vim.keymap.set('n', '<leader>[', ':BufferLineCyclePrev<CR>', { desc = 'Previous buffer' })
-vim.keymap.set('n', '<leader>x', ':bdelete<CR>', { desc = 'Close buffer' })
+vim.keymap.set('n', '<leader>x', function()
+  local current = vim.fn.bufnr()
+  vim.cmd('BufferLineCyclePrev')
+  vim.cmd('bdelete ' .. current)
+end, { desc = 'Close buffer' })
+
+vim.keymap.set('n', '<leader>X', function()
+  local current = vim.fn.bufnr()
+  vim.cmd('BufferLineCyclePrev')
+  vim.cmd('bdelete! ' .. current)
+end, { desc = 'Force close buffer' })
 
 -- Telescope (fuzzy finder)
 vim.keymap.set('n', '<leader>ff', ':Telescope find_files<CR>', { desc = 'Find files' })
@@ -70,7 +93,22 @@ vim.keymap.set('n', '<leader>rn', vim.lsp.buf.rename, { desc = 'Rename symbol' }
 -- Auto-reload files changed outside Neovim
 vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter", "CursorHold" }, {
   callback = function()
+    local view = vim.fn.winsaveview()
     vim.cmd("checktime")
+    vim.fn.winrestview(view)
+  end,
+})
+
+-- Refresh illuminate after file reloads
+vim.api.nvim_create_autocmd("FileChangedShellPost", {
+  callback = function()
+    vim.defer_fn(function()
+      pcall(function()
+        local illuminate = require("illuminate")
+        illuminate.invisible_buf()
+        illuminate.visible_buf()
+      end)
+    end, 50)
   end,
 })
 
@@ -226,6 +264,17 @@ require("lazy").setup({
     dependencies = { "nvim-lua/plenary.nvim" },
     config = function()
       require("diffview").setup({})
+    end,
+  },
+
+  -- Highlight word under cursor
+  {
+    "RRethy/vim-illuminate",
+    config = function()
+      require("illuminate").configure({
+        delay = 100,
+        under_cursor = true,
+      })
     end,
   },
 })

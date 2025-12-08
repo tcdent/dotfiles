@@ -13,10 +13,12 @@ Leader key is `Space`.
 ### Buffers
 - `<leader>]` - Next buffer
 - `<leader>[` - Previous buffer
-- `<leader>x` - Close buffer
+- `<leader>x` - Close buffer (cycles to previous)
+- `<leader>n` - New/empty buffer
 
 ### Windows
-- `<leader>t` - New vertical split (reuses empty buffer)
+- `<leader>t` - New split right
+- `<leader>T` - New split left
 - `<leader>w` + `h/j/k/l` - Move between windows
 - `Ctrl-w q` - Close window
 
@@ -64,6 +66,8 @@ Leader key is `Space`.
 - `Ctrl-v` - Block selection
 - Then use motions (`j`, `k`, `w`, etc.) to extend
 - `d` to delete, `y` to yank, `c` to change
+- `>` / `<` - Indent / dedent
+- `gc` - Toggle comment
 
 ## Git Commits
 

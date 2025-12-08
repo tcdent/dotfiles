@@ -145,6 +145,7 @@ hi('@type.definition', { fg = '#6CAFBD' })
 
 hi('@string', { fg = '#b78b67' })
 hi('@string.documentation', { fg = '#6774AF', italic = true })
+hi('@string.documentation.python', { fg = '#6774AF', italic = true })
 
 hi('@comment', { fg = '#6774AF', italic = true })
 
@@ -165,6 +166,9 @@ hi('@namespace', { fg = '#6CAFBD' })
 hi('@variable.builtin.python', { fg = '#6273c0' }) -- self, cls
 hi('@decorator.python', { fg = '#5f5db4' })
 hi('@class.python', { fg = '#6CAFBD' })
+
+-- LSP semantic tokens (clear so treesitter wins for docstrings)
+hi('@lsp.type.string.python', {})
 
 -- Neo-tree
 hi('NeoTreeNormal', { fg = '#dd7a9f', bg = '#1E1E1E' })
