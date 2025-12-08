@@ -10,6 +10,8 @@
 !nvim/**
 !tmux/
 !tmux/**
+!mcp/
+!mcp/**
 
 # And these files
 !.gitignore
