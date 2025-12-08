@@ -12,6 +12,8 @@
 !tmux/**
 !mcp/
 !mcp/**
+!claude/
+!claude/**
 
 # And these files
 !.gitignore

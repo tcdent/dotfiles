@@ -1,6 +1,6 @@
 # dotfiles
 
-Personal config for tmux, nvim, and ghostty.
+Personal config files.
 
 ## Setup
 
@@ -20,11 +20,19 @@ Install dependencies:
 brew install neovim tmux neovim-remote pyright
 ```
 
+Set up Claude Code symlinks:
+```bash
+mkdir -p ~/.claude
+ln -sf ~/.config/claude/settings.json ~/.claude/settings.json
+ln -sf ~/.config/claude/CLAUDE.md ~/.claude/CLAUDE.md
+```
+
 ## What's Here
 
 - **nvim/** - Neovim config with lazy.nvim, treesitter, LSP, copilot
 - **tmux/** - tmux config with dev workspace layout (`prefix + w`)
 - **ghostty/** - Terminal colors and settings
+- **claude/** - Claude Code settings and instructions (symlinked to `~/.claude/`)
 - **bin/** - Helper scripts:
   - `nvims` - Open file in current nvim session
   - `nvimw` - Same but waits (for git commits)
