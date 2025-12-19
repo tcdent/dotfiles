@@ -1,0 +1,3 @@
+#!/bin/zsh
+export DOCKER_HOST="unix://$HOME/.local/share/containers/podman/machine/podman.sock"
+exec lazydocker "$@"

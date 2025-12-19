@@ -73,6 +73,15 @@ vim.keymap.set('n', '<leader>X', function()
   vim.cmd('bdelete! ' .. current)
 end, { desc = 'Force close buffer' })
 
+-- :wc = write and close buffer (keeps window open)
+vim.api.nvim_create_user_command('Wc', function()
+  local current = vim.fn.bufnr()
+  vim.cmd('write')
+  vim.cmd('BufferLineCyclePrev')
+  vim.cmd('bdelete ' .. current)
+end, {})
+vim.cmd('cnoreabbrev wc Wc')
+
 -- Telescope (fuzzy finder)
 local launch_cwd = vim.fn.getcwd()
 vim.keymap.set('n', '<leader>ff', function()
@@ -128,9 +137,11 @@ vim.api.nvim_create_autocmd("BufReadPost", {
   pattern = "*.json",
   callback = function()
     vim.opt_local.wrap = true
-    local ok = pcall(vim.cmd, "%!jq .")
-    if not ok then
-      vim.cmd("undo")
+    -- Check if jq can parse the file first
+    local filepath = vim.fn.expand("%:p")
+    local check = vim.fn.system("jq empty " .. vim.fn.shellescape(filepath) .. " 2>&1")
+    if vim.v.shell_error == 0 then
+      vim.cmd("%!jq .")
     end
   end,
 })
