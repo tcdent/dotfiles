@@ -125,6 +125,36 @@ hi('Error', { fg = '#b78b67' })
 hi('Warning', { fg = '#564b42' })
 hi('Info', { fg = '#6774AF' })
 
+-- Diagnostics (LSP)
+hi('DiagnosticError', { fg = '#D65A77' })
+hi('DiagnosticWarn', { fg = '#d4a373' })
+hi('DiagnosticInfo', { fg = '#8899bb' })
+hi('DiagnosticHint', { fg = '#a8c49a' })
+
+-- Virtual text (inline hints - subtle)
+hi('DiagnosticVirtualTextError', { fg = '#8a4455', bg = '#2a2020' })
+hi('DiagnosticVirtualTextWarn', { fg = '#8a7355', bg = '#2a2520' })
+hi('DiagnosticVirtualTextInfo', { fg = '#556688', bg = '#202028' })
+hi('DiagnosticVirtualTextHint', { fg = '#5a7a55', bg = '#202520' })
+
+-- Underlines
+hi('DiagnosticUnderlineError', { undercurl = true, sp = '#7a5a5f' })
+hi('DiagnosticUnderlineWarn', { undercurl = true, sp = '#7a7060' })
+hi('DiagnosticUnderlineInfo', { undercurl = true, sp = '#606878' })
+hi('DiagnosticUnderlineHint', { undercurl = true, sp = '#607060' })
+
+-- Floating windows (hover - more readable)
+hi('DiagnosticFloatingError', { fg = '#e07a8a' })
+hi('DiagnosticFloatingWarn', { fg = '#e0b888' })
+hi('DiagnosticFloatingInfo', { fg = '#99aacc' })
+hi('DiagnosticFloatingHint', { fg = '#b8d4aa' })
+
+-- Sign column icons
+hi('DiagnosticSignError', { fg = '#D65A77', bg = c.bg })
+hi('DiagnosticSignWarn', { fg = '#d4a373', bg = c.bg })
+hi('DiagnosticSignInfo', { fg = '#8899bb', bg = c.bg })
+hi('DiagnosticSignHint', { fg = '#a8c49a', bg = c.bg })
+
 -- Treesitter
 hi('@variable', { fg = '#cb768a' })
 hi('@variable.builtin', { fg = '#b783c9' })
@@ -227,7 +257,7 @@ vim.g.terminal_color_14 = '#6CAFBD'  -- bright cyan
 vim.g.terminal_color_15 = '#dd7a9f'  -- bright white
 
 -- Bufferline (tab bar)
-hi('BufferLineBufferSelected', { fg = '#FFFFFF', bg = '#2a2a2a', bold = true })
+hi('BufferLineBufferSelected', { fg = '#FFFFFF', bg = '#2a2a2a' })
 hi('BufferLineIndicatorSelected', { fg = '#c86ead', bg = '#2a2a2a' })
 hi('BufferLineBuffer', { fg = '#808080', bg = '#1E1E1E' })
 hi('BufferLineBackground', { fg = '#808080', bg = '#1E1E1E' })

@@ -7,7 +7,8 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:*)",
-      "Bash(find :*)"
+      "Bash(find :*)",
+      "Bash(grep :*)"
     ],
     "ask": [
       "Bash(rm:*)"

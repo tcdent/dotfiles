@@ -1,0 +1,4 @@
+#!/bin/zsh
+ln -sf display.docked ~/.config/ghostty/display
+ghostty-reload-config
+echo "Switched to docked display settings."

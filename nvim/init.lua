@@ -1,6 +1,7 @@
 local buffers = require("buffers")
 require("hooks")
 require("python")
+require("rust")
 require("markdown")
 require("neotree")
 
@@ -20,7 +21,8 @@ vim.g.mapleader = ' '              -- Space as leader key
 -- Buffer/scroll position settings
 vim.opt.hidden = true              -- Keep buffers loaded in background
 vim.opt.laststatus = 0             -- Disable bottom statusline (using winbar instead)
-vim.opt.scrolloff = 20             -- Keep lines visible above/below cursor
+vim.opt.scrolloff = 0              -- Disabled for smoother edge scrolling
+vim.opt.smoothscroll = true        -- Smooth scrolling at edges
 vim.opt.cursorline = true          -- Highlight current line
 vim.opt.colorcolumn = "80,110"     -- Column guides
 vim.opt.list = true                -- Show whitespace
@@ -72,8 +74,13 @@ vim.keymap.set('n', '<leader>X', function()
 end, { desc = 'Force close buffer' })
 
 -- Telescope (fuzzy finder)
-vim.keymap.set('n', '<leader>ff', ':Telescope find_files<CR>', { desc = 'Find files' })
-vim.keymap.set('n', '<leader>fg', ':Telescope live_grep<CR>', { desc = 'Live grep' })
+local launch_cwd = vim.fn.getcwd()
+vim.keymap.set('n', '<leader>ff', function()
+  require('telescope.builtin').find_files({ cwd = launch_cwd })
+end, { desc = 'Find files' })
+vim.keymap.set('n', '<leader>fg', function()
+  require('telescope.builtin').live_grep({ cwd = launch_cwd })
+end, { desc = 'Live grep' })
 vim.keymap.set('n', '<leader>fb', ':Telescope buffers<CR>', { desc = 'Browse buffers' })
 
 -- Git
@@ -81,11 +88,15 @@ vim.keymap.set('n', '<leader>d', ':DiffviewOpen<CR>', { desc = 'Git diff view' }
 vim.keymap.set('n', '<leader>D', ':DiffviewClose<CR>', { desc = 'Close diff view' })
 
 -- Diagnostics
-vim.keymap.set('n', '<leader>l', vim.diagnostic.open_float, { desc = 'Show diagnostic' })
+vim.keymap.set('n', '<leader>l', function()
+  require('ai_diagnostics').explain_diagnostic()
+end, { desc = 'AI explain diagnostic' })
 
 -- LSP
 vim.keymap.set('n', 'gd', vim.lsp.buf.definition, { desc = 'Go to definition' })
-vim.keymap.set('n', 'gr', vim.lsp.buf.references, { desc = 'Find references' })
+vim.keymap.set('n', 'gr', function()
+  require('telescope.builtin').lsp_references()
+end, { desc = 'Find references' })
 vim.keymap.set('n', 'K', vim.lsp.buf.hover, { desc = 'Hover docs' })
 vim.keymap.set('n', '<leader>rn', vim.lsp.buf.rename, { desc = 'Rename symbol' })
 
@@ -109,6 +120,18 @@ vim.api.nvim_create_autocmd("FileChangedShellPost", {
         illuminate.visible_buf()
       end)
     end, 50)
+  end,
+})
+
+-- Format JSON files on open
+vim.api.nvim_create_autocmd("BufReadPost", {
+  pattern = "*.json",
+  callback = function()
+    vim.opt_local.wrap = true
+    local ok = pcall(vim.cmd, "%!jq .")
+    if not ok then
+      vim.cmd("undo")
+    end
   end,
 })
 
@@ -198,7 +221,7 @@ require("lazy").setup({
     build = ":TSUpdate",
     config = function()
       require("nvim-treesitter.configs").setup({
-        ensure_installed = { "lua", "vim", "python", "javascript", "typescript", "json", "yaml" },
+        ensure_installed = { "lua", "vim", "python", "javascript", "typescript", "json", "yaml", "rust" },
         auto_install = true,
         highlight = {
           enable = true,
@@ -224,13 +247,33 @@ require("lazy").setup({
     end,
   },
 
-  -- Claude Code MCP integration
+
+  -- Claude code MCP integration
   {
     "coder/claudecode.nvim",
     config = function()
       require("claudecode").setup({})
     end,
   },
+
+  -- Agent Code MCP integration (local dev)
+  -- {
+  --   dir = "~/Work/agentcode.nvim",
+  --   name = "agentcode.nvim",
+  --   config = function()
+  --     require("claudecode").setup({})
+  --   end,
+  -- },
+  --
+  -- OpenCode integration
+  -- {
+  --   "sudo-tee/opencode.nvim",
+  --   config = function()
+  --     require("opencode").setup({
+  --       default_global_keymaps = false,
+  --     })
+  --   end,
+  -- },
 
   -- GitHub Copilot
   {
@@ -272,7 +315,7 @@ require("lazy").setup({
     "RRethy/vim-illuminate",
     config = function()
       require("illuminate").configure({
-        delay = 100,
+        delay = 500,
         under_cursor = true,
       })
     end,

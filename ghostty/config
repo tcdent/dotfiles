@@ -1,5 +1,16 @@
+auto-update = download
+auto-update-channel = tip
+
+maximize = true
+window-inherit-working-directory = false
+
 font-family = Menlo
-font-size = 12
+font-family-italic = Menlo-Italic
+font-family-bold = Menlo-Bold
+font-family-bold-italic = Menlo-BoldItalic
+window-inherit-font-size = false
+config-file = display
+
 theme = Dark+
 
 background = 1E1E1E
@@ -27,10 +38,14 @@ palette = 13=c86ead
 palette = 14=6CAFBD
 palette = 15=FFFFFF
 
+macos-icon = custom-style
+macos-icon-screen-color = a41e6a
+macos-icon-ghost-color = c86ead
+
 window-padding-x = 5
 window-padding-y = 5
-window-theme = dark
-window-decoration = true
+window-position-x = 0
+window-position-y = 0
 
 cursor-style = block
 cursor-style-blink = true

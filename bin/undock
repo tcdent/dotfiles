@@ -1,0 +1,4 @@
+#!/bin/zsh
+ln -sf display.laptop ~/.config/ghostty/display
+ghostty-reload-config
+echo "Switched to laptop display settings."

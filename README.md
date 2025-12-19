@@ -17,7 +17,8 @@ export GIT_EDITOR='nvimw'
 
 Install dependencies:
 ```bash
-brew install neovim tmux neovim-remote pyright
+brew install neovim tmux neovim-remote ty
+rustup component add rust-analyzer
 ```
 
 Set up Claude Code symlinks:
@@ -29,13 +30,15 @@ ln -sf ~/.config/claude/CLAUDE.md ~/.claude/CLAUDE.md
 
 ## What's Here
 
-- **nvim/** - Neovim config with lazy.nvim, treesitter, LSP, copilot
+- **nvim/** - Neovim config with lazy.nvim, treesitter, LSP (Python, Rust), copilot, AI diagnostics
 - **tmux/** - tmux config with dev workspace layout (`prefix + w`)
-- **ghostty/** - Terminal colors and settings
+- **ghostty/** - Terminal colors and settings, display switching (see [ghostty/README.md](ghostty/README.md))
 - **claude/** - Claude Code settings and instructions (symlinked to `~/.claude/`)
 - **bin/** - Helper scripts:
   - `nvims` - Open file in current nvim session
   - `nvimw` - Same but waits (for git commits)
+  - `dock` / `undock` - Switch Ghostty settings for external/laptop display
+  - `ghostty-reload-config` - Reload Ghostty config
 
 ## nvim + tmux Integration
 

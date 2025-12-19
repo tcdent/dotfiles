@@ -26,12 +26,12 @@ Leader key is `Space`.
 - `<leader>d` - Open diff view
 - `<leader>D` - Close diff view
 
-### LSP (Python)
+### LSP (Python, Rust)
 - `gd` - Go to definition
-- `gr` - Find references
+- `gr` - Find references (via Telescope)
 - `K` - Hover docs
 - `<leader>rn` - Rename symbol
-- `<leader>l` - Show diagnostic message
+- `<leader>l` - Show diagnostic with AI explanation (requires `ANTHROPIC_API_KEY` in `~/.env`)
 
 ## Vim Essentials
 
