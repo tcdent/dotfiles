@@ -4,6 +4,8 @@ local M = {}
 -- Track current float window/buffer
 local current_win = nil
 local current_buf = nil
+local original_win = nil
+local original_view = nil
 
 -- Read API key from ~/.env
 local function get_api_key()
@@ -90,20 +92,22 @@ local function show_float(content, severity, update_only)
     })
     
     -- Close on any key
-    vim.keymap.set("n", "<Esc>", function()
+    local function close_float()
       if current_win and vim.api.nvim_win_is_valid(current_win) then
         vim.api.nvim_win_close(current_win, true)
       end
-      current_win = nil
-      current_buf = nil
-    end, { buffer = current_buf })
-    vim.keymap.set("n", "q", function()
-      if current_win and vim.api.nvim_win_is_valid(current_win) then
-        vim.api.nvim_win_close(current_win, true)
+      -- Restore original scroll position
+      if original_win and vim.api.nvim_win_is_valid(original_win) and original_view then
+        vim.api.nvim_set_current_win(original_win)
+        vim.fn.winrestview(original_view)
       end
       current_win = nil
       current_buf = nil
-    end, { buffer = current_buf })
+      original_win = nil
+      original_view = nil
+    end
+    vim.keymap.set("n", "<Esc>", close_float, { buffer = current_buf })
+    vim.keymap.set("n", "q", close_float, { buffer = current_buf })
   end
   
   -- Clear old highlights and apply new ones
@@ -178,6 +182,10 @@ end
 
 -- Main function: show AI-enhanced diagnostic
 function M.explain_diagnostic()
+  -- Save original window and view before opening float
+  original_win = vim.api.nvim_get_current_win()
+  original_view = vim.fn.winsaveview()
+  
   local bufnr = vim.api.nvim_get_current_buf()
   local cursor = vim.api.nvim_win_get_cursor(0)
   local line = cursor[1] - 1

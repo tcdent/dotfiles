@@ -31,7 +31,10 @@ ln -sf ~/.config/claude/CLAUDE.md ~/.claude/CLAUDE.md
 ## What's Here
 
 - **nvim/** - Neovim config with lazy.nvim, treesitter, LSP (Python, Rust), copilot, AI diagnostics
-- **tmux/** - tmux config with dev workspace layout (`prefix + w`)
+- **tmux/** - tmux config with workspaces:
+  - `prefix + w` - dev workspace (nvim + 4 shells)
+  - `prefix + e` - stats workspace (btop, lazypodman, logs)
+  - `prefix + : respawn-pane -k` - restart a pane
 - **ghostty/** - Terminal colors and settings, display switching (see [ghostty/README.md](ghostty/README.md))
 - **claude/** - Claude Code settings and instructions (symlinked to `~/.claude/`)
 - **bin/** - Helper scripts:

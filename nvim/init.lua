@@ -61,6 +61,11 @@ end, { desc = 'New/empty buffer' })
 -- Buffer navigation (cycles through tabs at top)
 vim.keymap.set('n', '<leader>]', ':BufferLineCycleNext<CR>', { desc = 'Next buffer' })
 vim.keymap.set('n', '<leader>[', ':BufferLineCyclePrev<CR>', { desc = 'Previous buffer' })
+
+-- Keep selection after indent
+vim.keymap.set('v', '>', '>gv', { silent = true })
+vim.keymap.set('v', '<', '<gv', { silent = true })
+
 vim.keymap.set('n', '<leader>x', function()
   local current = vim.fn.bufnr()
   vim.cmd('BufferLineCyclePrev')
