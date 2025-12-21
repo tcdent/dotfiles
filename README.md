@@ -19,6 +19,7 @@ Install dependencies:
 ```bash
 brew install neovim tmux neovim-remote ty
 rustup component add rust-analyzer
+rustup install nightly  # for rustfmt with group_imports
 ```
 
 Set up Claude Code symlinks:
@@ -42,6 +43,7 @@ ln -sf ~/.config/claude/CLAUDE.md ~/.claude/CLAUDE.md
   - `nvimw` - Same but waits (for git commits)
   - `dock` / `undock` - Switch Ghostty settings for external/laptop display
   - `ghostty-reload-config` - Reload Ghostty config
+- **rustfmt/** - Rust formatting config (uses nightly for `group_imports`)
 
 ## nvim + tmux Integration
 
