@@ -7,7 +7,7 @@ hard_tabs = false
 newline_style = "Unix"
 
 # Be more generous with single-line formatting
-use_small_heuristics = "Max"
+use_small_heuristics = "Default"
 
 # Keep imports tidy (requires nightly)
 unstable_features = true
