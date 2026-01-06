@@ -1,0 +1,28 @@
+
+[general]
+compaction_threshold = 192000
+
+[auth]
+method = "o_auth"
+
+[tools.shell]
+allow = [
+    "^ls\\b",
+    "^find\\b",
+    "^rg\\b",
+    "^cat\\b",
+    "^head\\b",
+    "^tail\\b",
+    "^grep\\b",
+    "^git status\\b",
+    "^git log\\b",
+    "^git diff\\b",
+    "^git show\\b",
+    "^cargo check\\b",
+    "^cargo test\\b",
+]
+
+[tools.read_file]
+allow = [
+    "^(?!/)(?!.*\\.\\.)",  # doesn't start with "/" and doesn't contain ".."
+]

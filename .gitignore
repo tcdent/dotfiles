@@ -12,6 +12,8 @@
 !tmux/**
 !mcp/
 !mcp/**
+!codey/
+!codey/**
 !claude/
 !claude/**
 !rustfmt/
