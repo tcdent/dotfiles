@@ -102,7 +102,7 @@ vim.keymap.set('n', '<leader>d', ':DiffviewOpen<CR>', { desc = 'Git diff view' }
 vim.keymap.set('n', '<leader>D', ':DiffviewClose<CR>', { desc = 'Close diff view' })
 
 -- Diagnostics
-vim.keymap.set('n', '<leader>l', function()
+vim.keymap.set('n', '<leader>v', function()
   require('ai_diagnostics').explain_diagnostic()
 end, { desc = 'AI explain diagnostic' })
 
@@ -238,6 +238,7 @@ require("lazy").setup({
     config = function()
       require("nvim-treesitter.configs").setup({
         ensure_installed = { "lua", "vim", "python", "javascript", "typescript", "json", "yaml", "rust" },
+        sync_install = true,  -- Block until parsers are installed (helps on fresh machines)
         auto_install = true,
         highlight = {
           enable = true,
