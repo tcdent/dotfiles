@@ -17,7 +17,7 @@ export GIT_EDITOR='nvimw'
 
 Install dependencies:
 ```bash
-brew install neovim tmux neovim-remote ty
+brew install neovim tmux neovim-remote ty lazydocker blueutil
 rustup component add rust-analyzer
 rustup install nightly  # for rustfmt with group_imports
 ```
@@ -43,6 +43,8 @@ ln -sf ~/.config/claude/CLAUDE.md ~/.claude/CLAUDE.md
   - `nvimw` - Same but waits (for git commits)
   - `dock` / `undock` - Switch Ghostty settings for external/laptop display
   - `ghostty-reload-config` - Reload Ghostty config
+  - `lazypodman` - lazydocker wrapper for Podman
+  - `release` - Disconnect Bluetooth keyboard/mouse (for switching to another paired Mac)
 - **rustfmt/** - Rust formatting config (uses nightly for `group_imports`)
 
 ## nvim + tmux Integration

@@ -1,0 +1,8 @@
+#!/bin/bash
+# Release Bluetooth devices so another paired Mac can grab them
+
+echo "Turning Bluetooth off for 30 seconds..."
+blueutil --power 0
+sleep 30
+blueutil --power 1
+echo "Bluetooth back on."
