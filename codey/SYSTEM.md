@@ -4,6 +4,12 @@
 - Today's date: <%= $(date +"%m-%d-%Y") %>
 - Project root: <%= $(pwd) %>
 
+<% if which uv > /dev/null 2>&1; then -%>
+## Python
+
+Use `uv` for Python package management and running scripts (`uv run`, `uv add`, `uv pip`).
+
+<% fi -%>
 <% if which gh > /dev/null 2>&1; then -%>
 ## GitHub CLI
 
