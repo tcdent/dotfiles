@@ -7,6 +7,7 @@ method = "o_auth"
 
 [tools.shell]
 allow = [
+    "^sleep \\d+\\b",
     "^ls\\b",
     "^find\\b",
     "^rg\\b",
@@ -25,4 +26,14 @@ allow = [
 [tools.read_file]
 allow = [
     "^(?!/)(?!.*\\.\\.)",  # doesn't start with "/" and doesn't contain ".."
+]
+
+[tools.list_background_tasks]
+allow = [
+    ".*",
+]
+
+[tools.get_background_task]
+allow = [
+    ".*",
 ]
