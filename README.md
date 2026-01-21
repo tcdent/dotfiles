@@ -17,7 +17,7 @@ export GIT_EDITOR='nvimw'
 
 Install dependencies:
 ```bash
-brew install neovim tmux neovim-remote ty lazydocker blueutil
+brew install neovim tmux neovim-remote ty lazydocker blueutil ruff
 rustup component add rust-analyzer
 rustup install nightly  # for rustfmt with group_imports
 ```

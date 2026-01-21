@@ -31,7 +31,7 @@ Leader key is `Space`.
 - `gr` - Find references (via Telescope)
 - `K` - Hover docs
 - `<leader>rn` - Rename symbol
-- `<leader>l` - Show diagnostic with AI explanation (requires `ANTHROPIC_API_KEY` in `~/.env`)
+- `<leader>v` - Show diagnostic with AI explanation (requires `ANTHROPIC_API_KEY` in `~/.env`)
 
 ## Vim Essentials
 
@@ -68,6 +68,11 @@ Leader key is `Space`.
 - `d` to delete, `y` to yank, `c` to change
 - `>` / `<` - Indent / dedent
 - `gc` - Toggle comment
+
+## First-Time Setup
+
+### GitHub Copilot
+Run `:Copilot setup` to authenticate with GitHub.
 
 ## Git Commits
 
