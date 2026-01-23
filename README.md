@@ -22,6 +22,11 @@ rustup component add rust-analyzer
 rustup install nightly  # for rustfmt with group_imports
 ```
 
+Optionally install esh for debugging codey's system template (codey has it built-in, but useful for testing). Use git version - brew is outdated:
+```bash
+curl -o ~/.local/bin/esh https://raw.githubusercontent.com/jirutka/esh/master/esh && chmod +x ~/.local/bin/esh
+```
+
 Set up Claude Code symlinks:
 ```bash
 mkdir -p ~/.claude
