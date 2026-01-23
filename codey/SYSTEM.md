@@ -4,6 +4,22 @@
 - Today's date: <%= $(date +"%m-%d-%Y") %>
 - Project root: <%= $(pwd) %>
 
+<% if [ -n "$TMUX" ]; then -%>
+## tmux
+
+- Session: `<%= $(tmux display-message -p '#S') %>`
+- Panes:
+<% tmux list-panes -F '  - #{pane_index}: #{pane_title}' %>
+
+Typical layout: pane 1 is codey, pane 2 is interactive shell, panes 3-4 are servers, last pane is nvim.
+
+Useful commands:
+- `tmux capture-pane -t {pane} -p` - get recent output from a pane
+- `tmux send-keys -t {pane} 'command' C-m` - send keys to a pane
+
+Note: Don't read from the nvim pane; use `edit_file` and `open_file` tools instead (they connect to nvim directly).
+
+<% fi -%>
 <% if which uv > /dev/null 2>&1; then -%>
 ## Python
 
