@@ -20,6 +20,7 @@ Leader key is `Space`.
 - `<leader>t` - New split right
 - `<leader>T` - New split left
 - `<leader>w` + `h/j/k/l` - Move between windows
+- `Ctrl-w =` - Equalize window sizes
 - `Ctrl-w q` - Close window
 
 ### Git
