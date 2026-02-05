@@ -101,6 +101,15 @@ vim.keymap.set('n', '<leader>fb', ':Telescope buffers<CR>', { desc = 'Browse buf
 vim.keymap.set('n', '<leader>d', ':DiffviewOpen<CR>', { desc = 'Git diff view' })
 vim.keymap.set('n', '<leader>D', ':DiffviewClose<CR>', { desc = 'Close diff view' })
 
+-- Git diff viewer
+-- :D              - unstaged changes (working tree diff)
+-- :D main...head  - diff branch against main (PR review)
+-- :D head~3       - last 3 commits
+vim.api.nvim_create_user_command('D', function(opts)
+  local args = opts.args:gsub('%f[%w]head%f[%W]', 'HEAD')
+  vim.cmd('DiffviewOpen ' .. args)
+end, { nargs = '?' })
+
 -- Diagnostics
 vim.keymap.set('n', '<leader>v', function()
   require('ai_diagnostics').explain_diagnostic()
