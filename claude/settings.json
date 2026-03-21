@@ -1,18 +1,21 @@
 {
-  "statusLine": {
-    "type": "command",
-    "command": "printf '%s:%s ' \"$(hostname -s)\" \"$(pwd | sed \"s|^$HOME|~|\")\""
-  },
-  "alwaysThinkingEnabled": true,
   "permissions": {
     "allow": [
       "WebFetch(domain:*)",
       "Bash(find :*)",
       "Bash(grep :*)"
     ],
+    "deny": [],
     "ask": [
       "Bash(rm:*)"
-    ],
-    "deny": []
-  }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "printf '%s:%s ' \"$(hostname -s)\" \"$(pwd | sed \"s|^$HOME|~|\")\""
+  },
+  "alwaysThinkingEnabled": true,
+  "fastMode": true,
+  "skipDangerousModePermissionPrompt": true,
+  "promptSuggestionEnabled": false
 }

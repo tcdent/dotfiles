@@ -1,0 +1,142 @@
+# irssi config for Libera.Chat
+#
+# Credentials are set in ~/.config/irssi/startup (not committed to git).
+# Run with: irssi --home=~/.config/irssi
+#
+# To register a new nick:
+#   /connect libera
+#   /msg NickServ REGISTER yourpassword your@email.com
+
+servers = (
+  {
+    address = "irc.libera.chat";
+    chatnet = "libera";
+    port = "6697";
+    use_tls = "yes";
+    tls_verify = "yes";
+    # NOTE: autoconnect is OFF here because we connect via ~/.irssi/startup
+    # AFTER configuring SASL. This ensures authentication happens before
+    # joining any channels. See setup instructions above.
+    autoconnect = "no";
+  }
+);
+
+chatnets = { libera = { type = "IRC"; }; };
+
+channels = (
+  # ═══════════════════════════════════════════════════════════════════
+  # GENERAL TECH DISCUSSION / HN-ADJACENT
+  # ═══════════════════════════════════════════════════════════════════
+  { name = "#lobsters"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "##programming"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#libera"; chatnet = "libera"; autojoin = "yes"; },
+
+  # ═══════════════════════════════════════════════════════════════════
+  # AI / MACHINE LEARNING / DATA
+  # ═══════════════════════════════════════════════════════════════════
+  { name = "##machinelearning"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#AGI"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#RL"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#ml-ot"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "##data"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#ml-deploy"; chatnet = "libera"; autojoin = "yes"; },
+
+  # ═══════════════════════════════════════════════════════════════════
+  # PROGRAMMING LANGUAGES
+  # ═══════════════════════════════════════════════════════════════════
+  { name = "#python"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#rust"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "##rust-offtopic"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#haskell"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#haskell-offtopic"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#c"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#c-offtopic"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "##c++"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#go-nuts"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#lisp"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#scheme"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#clojure"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#ocaml"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#erlang"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#elixir"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#zig"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#lua"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#julia"; chatnet = "libera"; autojoin = "yes"; },
+
+  # ═══════════════════════════════════════════════════════════════════
+  # SYSTEMS / DISTROS / BSD
+  # ═══════════════════════════════════════════════════════════════════
+  { name = "#linux"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#archlinux"; chatnet = "libera"; autojoin = "yes"; },
+  { 
+    name = "#archlinux-offtopic";
+    chatnet = "libera";
+    autojoin = "yes";
+  },
+  { name = "#debian"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#debian-offtopic"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#gentoo"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#nixos"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#freebsd"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#openbsd"; chatnet = "libera"; autojoin = "yes"; },
+
+  # ═══════════════════════════════════════════════════════════════════
+  # TOOLS / EDITORS / INFRASTRUCTURE
+  # ═══════════════════════════════════════════════════════════════════
+  { name = "#git"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#vim"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#emacs"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#neovim"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#tmux"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#postgresql"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#docker"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#kubernetes"; chatnet = "libera"; autojoin = "yes"; },
+
+  # ═══════════════════════════════════════════════════════════════════
+  # SECURITY / NETWORKING
+  # ═══════════════════════════════════════════════════════════════════
+  { name = "#security"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#networking"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#cryptography"; chatnet = "libera"; autojoin = "yes"; },
+
+  # ═══════════════════════════════════════════════════════════════════
+  # HARDWARE / EMBEDDED / LOW-LEVEL
+  # ═══════════════════════════════════════════════════════════════════
+  { name = "#arduino"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#electronics"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#llvm"; chatnet = "libera"; autojoin = "yes"; },
+
+  # ═══════════════════════════════════════════════════════════════════
+  # MISC INTERESTING
+  # ═══════════════════════════════════════════════════════════════════
+  { name = "##math"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#latex"; chatnet = "libera"; autojoin = "yes"; },
+  { name = "#thelounge"; chatnet = "libera"; autojoin = "yes"; }
+);
+
+settings = {
+  core = { real_name = "slomp"; user_name = "slomp"; nick = "slomp"; };
+  "fe-text" = { actlist_sort = "refnum"; };
+  "fe-common/core" = {
+    theme = "default";
+    autolog = "yes";
+    autolog_path = "~/.config/irssi/logs/$tag/$0.log";
+    timestamps = "yes";
+    show_nickmode_empty = "yes";
+  };
+  "irc/core" = { alternate_nick = "slomp_"; };
+};
+
+# Enable logging
+logs = { };
+
+# Hilight your nick (set in startup)
+hilights = ( { text = "slomp"; nick = "yes"; word = "yes"; } );
+
+# Ignore joins/parts/quits in busy channels to reduce noise
+ignores = (
+  {
+    level = "JOINS PARTS QUITS";
+    channels = ( "#linux", "#python", "#archlinux", "#debian", "#ubuntu" );
+  }
+);

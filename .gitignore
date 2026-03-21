@@ -18,6 +18,12 @@
 !claude/**
 !rustfmt/
 !rustfmt/**
+!irssi/
+!irssi/**
+
+# Ignore irssi credentials and logs
+irssi/startup
+irssi/logs/
 
 # And these files
 !.gitignore

@@ -2,12 +2,22 @@
 [general]
 compaction_threshold = 192000
 
+[agents.foreground]
+#fast_mode = true
+
 [auth]
 method = "o_auth"
+
+[anthropic]
+cch_seed = 0x6e52736ac806831e
+cc_version_salt = "59cf53e54c78"
+user_id = "15ff3bec4829cdc744ca9206757b62d3150fc076e5fd33982733ad4a04097525"
+account_uuid = "c5df0620-63cd-4944-9721-fa72cbdf2297"
 
 [tools.shell]
 allow = [
     "^sleep \\d+\\b",
+    "^wc -l\\b",
     "^ls\\b",
     "^find\\b",
     "^rg\\b",
@@ -21,6 +31,9 @@ allow = [
     "^git show\\b",
     "^cargo check\\b",
     "^cargo test\\b",
+    "^tmux capture-pane\\b",
+    "^gh run view \\b",
+
 ]
 
 [tools.read_file]
@@ -37,3 +50,26 @@ allow = [
 allow = [
     ".*",
 ]
+
+[tools.list_agents]
+allow = [
+    ".*",
+]
+
+[tools.get_agent]
+allow = [
+    ".*",
+]
+
+[tools.web_search]
+allow = [
+    ".*",
+]
+
+[browser]
+#chrome_user_data_dir = "~/Library/Application Support/Google/Chrome"
+#chrome_profile = "Profile 9"
+#headless = false
+#viewport_width = 800
+#viewport_height = 4000
+#page_load_wait_ms = 10000
