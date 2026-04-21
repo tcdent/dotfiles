@@ -1,0 +1,1088 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["click>=8.1", "httpx>=0.27"]
+# ///
+"""
+agent-tracker: ticket and sprint operations for agents.
+
+Agent-facing CLI that wraps the backing ticket system (currently Plane).
+Callers' identities are discovered via environment or tmux pane title;
+the CLI reads ~/.agents/<email>/identity.env for per-agent credentials.
+
+The surface is deliberately narrow and intent-explicit:
+
+    agent-tracker auth    init                                     (one-time per host)
+
+    agent-tracker ticket  backlog    --name NAME --body BODY|-
+    agent-tracker ticket  body       TICKET_ID
+    agent-tracker ticket  state      TICKET_ID
+    agent-tracker ticket  comments   COMMENT_ID [COMMENT_ID...]
+    agent-tracker ticket  transition TICKET_ID STATE
+    agent-tracker ticket  comment    TICKET_ID --body BODY|-
+    agent-tracker ticket  promote    TICKET_ID SPRINT_ID            (planner role)
+    agent-tracker ticket  assign     TICKET_ID AGENT_IDENTITY        (planner role)
+
+    agent-tracker sprint  create     NAME --start DATE --end DATE    (planner role)
+
+    agent-tracker cache   refresh
+
+Conventions:
+    --body -                reads body from stdin
+    --json                  emit machine-readable JSON (default is human text)
+    --yes                   required for destructive ops in non-TTY
+    exit codes              0 ok, 1 user error, 2 API error, 3 auth error
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import click
+import httpx
+
+# --- embedded config -----------------------------------------------------
+
+PLANE_API_URL = "https://api.tracker.a10k.co"
+DEFAULT_WORKSPACE_SLUG = "a10k"
+
+# Workspace-admin PAT used only to grant project memberships during auth init.
+# Never loaded into agent context — agent-tracker reads it on demand from a
+# gitignored secrets file (~/.config is a public repo). Issued to the dedicated
+# admin.plane@a10k.internal service account (workspace role 20).
+def _load_admin_pat() -> str | None:
+    path = Path.home() / ".config" / "agent-tracker" / "secrets.env"
+    if not path.is_file():
+        return None
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k.strip() == "PLANE_ADMIN_PAT":
+            return v.strip()
+    return None
+
+
+PLANE_ADMIN_PAT: str | None = _load_admin_pat()
+
+# --- exit codes ----------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_USER_ERROR = 1
+EXIT_API_ERROR = 2
+EXIT_AUTH_ERROR = 3
+
+# --- identity discovery --------------------------------------------------
+
+IDENTITY_RE = re.compile(r"[a-zA-Z0-9._-]+@a10k\.internal")
+
+
+def discover_identity() -> str:
+    """Figure out who is running this CLI.
+
+    Resolution order:
+      1. $AGENT_EMAIL environment variable
+      2. tmux pane_title on the current pane (if in tmux)
+      3. error
+    """
+    email = os.environ.get("AGENT_EMAIL")
+    if email:
+        return email
+
+    tmux_pane = os.environ.get("TMUX_PANE")
+    if tmux_pane:
+        try:
+            title = subprocess.check_output(
+                ["tmux", "display-message", "-p", "-t", tmux_pane, "#{pane_title}"],
+                text=True,
+            ).strip()
+            match = IDENTITY_RE.search(title)
+            if match:
+                return match.group(0)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+
+    raise click.ClickException(
+        "could not determine caller identity — set AGENT_EMAIL or run inside "
+        "a tmux pane tagged with an @a10k.internal identity"
+    )
+
+
+def load_identity_env(email: str) -> dict[str, str]:
+    """Parse ~/.agents/<email>/identity.env into a dict."""
+    path = Path.home() / ".agents" / email / "identity.env"
+    if not path.is_file():
+        raise click.ClickException(
+            f"identity file missing: {path}\n"
+            "run `agent-register <identity>` to provision"
+        )
+    env: dict[str, str] = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        env[key.strip()] = value.strip()
+    return env
+
+
+# --- auth ---------------------------------------------------------------
+
+def get_auth_headers(identity: dict[str, str]) -> dict[str, str]:
+    """Return HTTP auth headers for Plane API calls.
+
+    Reads the agent's permanent PAT from ~/.agents/<email>/plane.pat. If the
+    PAT is missing, exits with the auth-error code pointing the caller at
+    `agent-tracker auth init`.
+    """
+    email = identity.get("AGENT_EMAIL")
+    if not email:
+        raise click.ClickException("identity is missing AGENT_EMAIL")
+    pat_path = Path.home() / ".agents" / email / "plane.pat"
+    if not pat_path.is_file():
+        ctx = click.get_current_context()
+        click.echo(
+            f"no Plane PAT at {pat_path}\n"
+            "run `agent-tracker auth init` to bootstrap credentials.",
+            err=True,
+        )
+        ctx.exit(EXIT_AUTH_ERROR)
+    return {"X-Api-Key": pat_path.read_text().strip()}
+
+
+# --- api helper (stub) --------------------------------------------------
+
+def api_call(
+    method: str,
+    path: str,
+    *,
+    identity: dict[str, str],
+    json_body: Any | None = None,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    """Make a Plane API call and return parsed JSON.
+
+    Raises click.ClickException with appropriate exit-code hints on errors.
+    """
+    url = f"{PLANE_API_URL}{path}"
+    headers = get_auth_headers(identity)
+    try:
+        response = httpx.request(
+            method, url,
+            headers=headers,
+            json=json_body,
+            params=params,
+            timeout=30.0,
+        )
+    except httpx.HTTPError as e:
+        raise click.ClickException(f"API request failed: {e}") from e
+
+    if response.status_code in (401, 403):
+        ctx = click.get_current_context()
+        ctx.exit(EXIT_AUTH_ERROR)
+    if response.status_code >= 400:
+        ctx = click.get_current_context()
+        click.echo(f"API error {response.status_code}: {response.text}", err=True)
+        ctx.exit(EXIT_API_ERROR)
+    if response.content:
+        return response.json()
+    return None
+
+
+# --- helpers ------------------------------------------------------------
+
+def read_body(body: str) -> str:
+    """If body is '-', read all of stdin; otherwise return as-is."""
+    if body == "-":
+        return sys.stdin.read()
+    return body
+
+
+def emit(data: Any, *, as_json: bool) -> None:
+    """Emit a result — JSON if requested, else a human-readable form."""
+    if as_json:
+        click.echo(json.dumps(data, indent=2, default=str))
+    elif isinstance(data, dict):
+        width = max((len(k) for k in data), default=0)
+        for key, value in data.items():
+            click.echo(f"{key:<{width}}  {value}")
+    elif isinstance(data, list):
+        for item in data:
+            click.echo(item)
+    else:
+        click.echo(data)
+
+
+def preview(action: str, **fields: Any) -> dict[str, Any]:
+    """Build the placeholder payload a stubbed command returns."""
+    return {"stub": action, "planned_request": fields}
+
+
+def derive_project_ident(email: str) -> str:
+    """mgmt.arch@a10k.internal → 'MGMT'. Project identifier derived from the
+    project-component of the agent's identity (local-part before first dot)."""
+    return email.split("@", 1)[0].split(".", 1)[0].upper()
+
+
+def resolve_project_uuid(
+    identity: dict[str, str], project_ident: str,
+    workspace_slug: str = DEFAULT_WORKSPACE_SLUG,
+) -> str | None:
+    """Look up a project's UUID by its short identifier in a workspace."""
+    data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{workspace_slug}/projects/",
+        identity=identity,
+    )
+    projects = data.get("results", data) if isinstance(data, dict) else data
+    match = next((p for p in projects if p.get("identifier") == project_ident), None)
+    return match["id"] if match else None
+
+
+TICKET_ID_RE = re.compile(r"^([A-Z]+)-(\d+)$")
+
+
+def resolve_user_uuid(
+    identity: dict[str, str], email: str,
+    workspace_slug: str = DEFAULT_WORKSPACE_SLUG,
+) -> str | None:
+    """Look up a workspace member's UUID by their email."""
+    data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{workspace_slug}/members/",
+        identity=identity,
+    )
+    members = data.get("results", data) if isinstance(data, dict) else data
+    target = email.strip().lower()
+    match = next((m for m in members if (m.get("email") or "").lower() == target), None)
+    return match["id"] if match else None
+
+
+def sum_estimates(tickets: list[dict[str, Any]]) -> int:
+    """Sum numeric estimate values across tickets. Tickets with null
+    estimate_point count as 0.
+
+    TODO(post-MGMT-6): estimate_point on an issue is a UUID FK into
+    EstimatePoint. The public REST API doesn't expose the
+    estimate-points endpoint, so we can't resolve UUID → value from the
+    CLI directly yet. Options when we wire this up: cache via
+    agent-tracker-admin export (preferred), or patch Plane to expose
+    estimates on the public API. Until then this returns 0 for any
+    ticket that DOES have an estimate — treat totals as a
+    lower-bound. Once resolution lands, swap the `continue` below for a
+    real lookup.
+    """
+    total = 0
+    for t in tickets:
+        if t.get("estimate_point") is None:
+            continue
+        continue  # TODO: resolve UUID → int(value) once estimate cache lands
+    return total
+
+
+def resolve_state_uuid(
+    identity: dict[str, str], project_uuid: str, state_name: str,
+    workspace_slug: str = DEFAULT_WORKSPACE_SLUG,
+) -> str | None:
+    """Look up a state's UUID by name (case-insensitive) inside a project."""
+    data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{workspace_slug}/projects/{project_uuid}/states/",
+        identity=identity,
+    )
+    states = data.get("results", data) if isinstance(data, dict) else data
+    target = state_name.strip().lower()
+    match = next((s for s in states if s["name"].lower() == target), None)
+    return match["id"] if match else None
+
+
+def resolve_ticket(
+    identity: dict[str, str], ticket_id: str,
+    workspace_slug: str = DEFAULT_WORKSPACE_SLUG,
+) -> tuple[str, str]:
+    """Parse 'MGMT-2' → (project_uuid, issue_uuid). Raises on failure."""
+    match = TICKET_ID_RE.match(ticket_id)
+    if not match:
+        raise click.ClickException(
+            f"bad ticket id {ticket_id!r}; expected <PROJECT>-<number>, e.g. MGMT-42"
+        )
+    project_ident, seq_str = match.group(1), int(match.group(2))
+    project_uuid = resolve_project_uuid(identity, project_ident, workspace_slug)
+    if not project_uuid:
+        raise click.ClickException(
+            f"no project '{project_ident}' in workspace '{workspace_slug}'"
+        )
+    data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{workspace_slug}/projects/{project_uuid}/issues/",
+        identity=identity,
+    )
+    issues = data.get("results", data) if isinstance(data, dict) else data
+    issue = next((i for i in issues if i.get("sequence_id") == seq_str), None)
+    if not issue:
+        raise click.ClickException(f"no ticket {ticket_id} in project {project_ident}")
+    return project_uuid, issue["id"]
+
+
+# --- CLI root -----------------------------------------------------------
+
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+@click.pass_context
+def cli(ctx: click.Context, as_json: bool) -> None:
+    """Ticket and sprint operations for agents."""
+    ctx.ensure_object(dict)
+    ctx.obj["as_json"] = as_json
+    ctx.obj["identity_email"] = discover_identity()
+    ctx.obj["identity"] = load_identity_env(ctx.obj["identity_email"])
+
+
+@cli.group()
+def ticket() -> None:
+    """Operations on tickets."""
+
+
+@cli.group()
+def sprint() -> None:
+    """Operations on sprints."""
+
+
+@cli.group()
+def cache() -> None:
+    """Manage local caches."""
+
+
+@cli.group()
+def auth() -> None:
+    """Authentication lifecycle for the backing ticket system."""
+
+
+@cli.group()
+def project() -> None:
+    """Project inspection (list and status)."""
+
+
+# --- ticket commands ----------------------------------------------------
+
+@ticket.command("backlog")
+@click.option("--name", required=True, help="Ticket name.")
+@click.option("--body", required=True, help="Ticket body; '-' reads stdin.")
+@click.pass_context
+def ticket_backlog(ctx: click.Context, name: str, body: str) -> None:
+    """Create a new ticket in the backlog of your identity-derived project."""
+    body = read_body(body)
+    identity = ctx.obj["identity"]
+    email = ctx.obj["identity_email"]
+
+    project_ident = derive_project_ident(email)
+    project_uuid = resolve_project_uuid(identity, project_ident)
+    if not project_uuid:
+        raise click.ClickException(
+            f"no project with identifier '{project_ident}' in workspace "
+            f"'{DEFAULT_WORKSPACE_SLUG}'"
+        )
+
+    description_html = f"<p>{body}</p>" if body else "<p></p>"
+    result = api_call(
+        "POST",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/",
+        identity=identity,
+        json_body={"name": name, "description_html": description_html},
+    )
+
+    emit(
+        {
+            "ticket": f"{project_ident}-{result['sequence_id']}",
+            "id": result["id"],
+            "name": result["name"],
+            "state": result.get("state"),
+            "project": project_ident,
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+@ticket.command("body")
+@click.argument("ticket_id")
+@click.pass_context
+def ticket_body(ctx: click.Context, ticket_id: str) -> None:
+    """Fetch a ticket's immutable body (the goal).
+
+    The body is set at creation and never changes — fetch once per ticket
+    and reuse. State, assignee, sprint, and comments live on other verbs.
+    """
+    identity = ctx.obj["identity"]
+    project_uuid, issue_uuid = resolve_ticket(identity, ticket_id)
+    issue = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/{issue_uuid}/",
+        identity=identity,
+    )
+    emit(
+        {
+            "ticket": ticket_id,
+            "name": issue["name"],
+            "body_html": issue.get("description_html") or "",
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+@ticket.command("state")
+@click.argument("ticket_id")
+@click.pass_context
+def ticket_state(ctx: click.Context, ticket_id: str) -> None:
+    """Compact mutable overview: status, assignee, sprint, and comment refs
+    (id, timestamp, author).
+
+    Designed to be re-checked cheaply — token-conscious snapshot that tells
+    you whether the ticket moved and what metadata to dig into next. The
+    body is separate (`ticket body`); comment bodies are separate
+    (`ticket comments`).
+    """
+    identity = ctx.obj["identity"]
+    project_uuid, issue_uuid = resolve_ticket(identity, ticket_id)
+
+    issue = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/{issue_uuid}/",
+        identity=identity,
+    )
+    comments = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/{issue_uuid}/comments/",
+        identity=identity,
+    )
+    comment_list = comments.get("results", comments) if isinstance(comments, dict) else comments
+
+    # Resolve state UUID → human-readable name (one extra GET; cheap).
+    states_data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/states/",
+        identity=identity,
+    )
+    states = states_data.get("results", states_data) if isinstance(states_data, dict) else states_data
+    state_name = next(
+        (s["name"] for s in states if s["id"] == issue.get("state")),
+        issue.get("state"),
+    )
+
+    # Find which sprint (if any) this ticket is attached to. Plane stores
+    # the association in a join table, not on the issue row, so we scan
+    # project cycles and check each. O(cycles) per call — acceptable at
+    # small-team scale; add caching if sprints proliferate.
+    cycles_data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/cycles/",
+        identity=identity,
+    )
+    cycles = cycles_data.get("results", cycles_data) if isinstance(cycles_data, dict) else cycles_data
+    sprint_ref = None
+    for cycle in cycles:
+        in_cycle_data = api_call(
+            "GET",
+            f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/cycles/{cycle['id']}/cycle-issues/",
+            identity=identity,
+        )
+        in_cycle = in_cycle_data.get("results", in_cycle_data) if isinstance(in_cycle_data, dict) else in_cycle_data
+        if any(i["id"] == issue_uuid for i in in_cycle):
+            sprint_ref = {"id": cycle["id"], "name": cycle["name"]}
+            break
+
+    emit(
+        {
+            "ticket": ticket_id,
+            "name": issue["name"],
+            "state": state_name,
+            "assignees": issue.get("assignees") or [],
+            "sprint": sprint_ref,
+            "updated_at": issue.get("updated_at"),
+            "comment_refs": [
+                {
+                    "id": c["id"],
+                    "author": c.get("actor") or c.get("created_by"),
+                    "created_at": c.get("created_at"),
+                }
+                for c in comment_list
+            ],
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+@ticket.command("comments")
+@click.argument("ticket_id")
+@click.argument("comment_ids", nargs=-1, required=True)
+@click.pass_context
+def ticket_comments(ctx: click.Context, ticket_id: str, comment_ids: tuple[str, ...]) -> None:
+    """Hydrate one or more comments on a ticket by id.
+
+    Rule of thumb:
+    - First encounter with a ticket: load all comments by passing every id
+      from `ticket state`.
+    - Re-engaging a ticket you already have context on: load only the new
+      ids (ones you don't already have).
+    """
+    identity = ctx.obj["identity"]
+    project_uuid, issue_uuid = resolve_ticket(identity, ticket_id)
+    wanted = set(comment_ids)
+
+    # Plane's comment endpoint returns the list; filter client-side by id.
+    data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/{issue_uuid}/comments/",
+        identity=identity,
+    )
+    comments = data.get("results", data) if isinstance(data, dict) else data
+
+    out = []
+    for c in comments:
+        if c["id"] in wanted:
+            out.append({
+                "id": c["id"],
+                "author": c.get("actor") or c.get("created_by"),
+                "created_at": c.get("created_at"),
+                "body_html": c.get("comment_html", ""),
+            })
+
+    missing = wanted - {c["id"] for c in out}
+    if missing:
+        click.echo(f"warn: {len(missing)} comment id(s) not found: {sorted(missing)}", err=True)
+
+    emit(out, as_json=ctx.obj["as_json"])
+
+
+@ticket.command("transition")
+@click.argument("ticket_id")
+@click.argument("state")
+@click.pass_context
+def ticket_transition(ctx: click.Context, ticket_id: str, state: str) -> None:
+    """Transition a ticket to a new state (e.g. 'In Progress', 'Done').
+
+    State lookup is case-insensitive against the project's configured states.
+    """
+    identity = ctx.obj["identity"]
+    project_uuid, issue_uuid = resolve_ticket(identity, ticket_id)
+    state_uuid = resolve_state_uuid(identity, project_uuid, state)
+    if not state_uuid:
+        raise click.ClickException(
+            f"no state named {state!r} in project (case-insensitive). "
+            "try: Backlog, Todo, In Progress, Done, Cancelled"
+        )
+
+    result = api_call(
+        "PATCH",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/{issue_uuid}/",
+        identity=identity,
+        json_body={"state": state_uuid},
+    )
+    emit(
+        {
+            "ticket": ticket_id,
+            "state": state,
+            "state_id": state_uuid,
+            "updated_at": result.get("updated_at"),
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+@ticket.command("comment")
+@click.argument("ticket_id")
+@click.option("--body", required=True, help="Comment body; '-' reads stdin.")
+@click.pass_context
+def ticket_comment(ctx: click.Context, ticket_id: str, body: str) -> None:
+    """Add a comment to a ticket."""
+    body = read_body(body)
+    identity = ctx.obj["identity"]
+    project_uuid, issue_uuid = resolve_ticket(identity, ticket_id)
+
+    comment_html = f"<p>{body}</p>" if body else "<p></p>"
+    result = api_call(
+        "POST",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/{issue_uuid}/comments/",
+        identity=identity,
+        json_body={"comment_html": comment_html},
+    )
+    emit(
+        {
+            "ticket": ticket_id,
+            "comment_id": result.get("id"),
+            "author": ctx.obj["identity_email"],
+            "created_at": result.get("created_at"),
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+@ticket.command("promote")
+@click.argument("ticket_id")
+@click.argument("sprint_id")
+@click.pass_context
+def ticket_promote(ctx: click.Context, ticket_id: str, sprint_id: str) -> None:
+    """Promote a backlog ticket to a sprint. (planner role)
+
+    SPRINT_ID is the UUID returned by `sprint create`.
+    """
+    identity = ctx.obj["identity"]
+    project_uuid, issue_uuid = resolve_ticket(identity, ticket_id)
+    result = api_call(
+        "POST",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/cycles/{sprint_id}/cycle-issues/",
+        identity=identity,
+        json_body={"issues": [issue_uuid]},
+    )
+    emit(
+        {
+            "ticket": ticket_id,
+            "sprint_id": sprint_id,
+            "attached": bool(result),
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+@ticket.command("assign")
+@click.argument("ticket_id")
+@click.argument("assignee")
+@click.pass_context
+def ticket_assign(ctx: click.Context, ticket_id: str, assignee: str) -> None:
+    """Assign a ticket to an agent. (planner role)
+
+    ASSIGNEE is an agent identity like mgmt.design@a10k.internal. Replaces
+    the assignee set — the ticket has a single owner after this call.
+    """
+    if "@" not in assignee:
+        raise click.ClickException(
+            f"assignee must be an agent identity email; got {assignee!r}"
+        )
+    identity = ctx.obj["identity"]
+    project_uuid, issue_uuid = resolve_ticket(identity, ticket_id)
+    user_uuid = resolve_user_uuid(identity, assignee)
+    if not user_uuid:
+        raise click.ClickException(
+            f"no workspace member with email {assignee!r}"
+        )
+    result = api_call(
+        "PATCH",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/{issue_uuid}/",
+        identity=identity,
+        json_body={"assignees": [user_uuid]},
+    )
+    emit(
+        {
+            "ticket": ticket_id,
+            "assignee": assignee,
+            "assignee_id": user_uuid,
+            "updated_at": result.get("updated_at"),
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+# --- sprint commands ----------------------------------------------------
+
+@sprint.command("create")
+@click.argument("name")
+@click.option("--start", "start", required=True, help="Start date (YYYY-MM-DD).")
+@click.option("--end", "end", required=True, help="End date (YYYY-MM-DD).")
+@click.pass_context
+def sprint_create(ctx: click.Context, name: str, start: str, end: str) -> None:
+    """Create a new sprint. (planner role)"""
+    identity = ctx.obj["identity"]
+    email = ctx.obj["identity_email"]
+    project_ident = derive_project_ident(email)
+    project_uuid = resolve_project_uuid(identity, project_ident)
+    if not project_uuid:
+        raise click.ClickException(
+            f"no project '{project_ident}' in workspace '{DEFAULT_WORKSPACE_SLUG}'"
+        )
+    result = api_call(
+        "POST",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/cycles/",
+        identity=identity,
+        # Plane requires project_id in the body despite the URL already scoping it.
+        json_body={
+            "name": name,
+            "start_date": start,
+            "end_date": end,
+            "project_id": project_uuid,
+        },
+    )
+    emit(
+        {
+            "sprint_id": result["id"],
+            "name": result["name"],
+            "start_date": result["start_date"],
+            "end_date": result["end_date"],
+            "project": project_ident,
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+# --- cache commands -----------------------------------------------------
+
+@cache.command("refresh")
+@click.pass_context
+def cache_refresh(ctx: click.Context) -> None:
+    """Invalidate cached states, members, sprints, labels."""
+    # TODO: clear ~/.cache/agent-tracker/<workspace>/ and re-fetch on next call
+    emit(preview("cache.refresh"), as_json=ctx.obj["as_json"])
+
+
+# --- project commands ---------------------------------------------------
+
+@project.command("list")
+@click.pass_context
+def project_list(ctx: click.Context) -> None:
+    """List projects you are a member of (identifier, name, id, role)."""
+    identity = ctx.obj["identity"]
+    data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/",
+        identity=identity,
+    )
+    projects = data.get("results", data) if isinstance(data, dict) else data
+    mine = [
+        {
+            "identifier": p["identifier"],
+            "name": p["name"],
+            "id": p["id"],
+            "role": p.get("member_role"),
+        }
+        for p in projects
+        if p.get("is_member")
+    ]
+    emit(mine, as_json=ctx.obj["as_json"])
+
+
+@project.command("status")
+@click.argument("identifier")
+@click.pass_context
+def project_status(ctx: click.Context, identifier: str) -> None:
+    """Overview of a project: active sprints, members, ticket state counts."""
+    identity = ctx.obj["identity"]
+    ident = identifier.upper()
+    project_uuid = resolve_project_uuid(identity, ident)
+    if not project_uuid:
+        raise click.ClickException(f"no project '{ident}' visible to you")
+
+    # Project members — emails only, no names.
+    members_data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/members/",
+        identity=identity,
+    )
+    proj_users = members_data.get("results", members_data) if isinstance(members_data, dict) else members_data
+    members_out = sorted(u.get("email", "?") for u in proj_users)
+
+    # Cycles — active = today between start and end
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    cycles_data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/cycles/",
+        identity=identity,
+    )
+    cycles = cycles_data.get("results", cycles_data) if isinstance(cycles_data, dict) else cycles_data
+    active = []
+    for c in cycles:
+        start = c.get("start_date")
+        end = c.get("end_date")
+        if start and end:
+            sd = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            ed = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            if sd <= now <= ed:
+                active.append({"id": c["id"], "name": c["name"], "start": start[:10], "end": end[:10]})
+
+    # States + issue counts per state
+    states_data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/states/",
+        identity=identity,
+    )
+    states = states_data.get("results", states_data) if isinstance(states_data, dict) else states_data
+    name_by_uuid = {s["id"]: s["name"] for s in states}
+
+    issues_data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/",
+        identity=identity,
+    )
+    issues = issues_data.get("results", issues_data) if isinstance(issues_data, dict) else issues_data
+    counts: dict[str, int] = {s["name"]: 0 for s in states}
+    for i in issues:
+        nm = name_by_uuid.get(i.get("state"), "unknown")
+        counts[nm] = counts.get(nm, 0) + 1
+
+    emit(
+        {
+            "project": ident,
+            "id": project_uuid,
+            "active_sprints": active,
+            "members": members_out,
+            "ticket_counts": counts,
+            "total_estimate": sum_estimates(issues),
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+# --- sprint commands (status) -------------------------------------------
+
+@sprint.command("status")
+@click.argument("sprint_id")
+@click.pass_context
+def sprint_status(ctx: click.Context, sprint_id: str) -> None:
+    """Detail on a sprint: dates, tickets with state, comment count, estimate.
+
+    Discovers which project contains the sprint by scanning projects you
+    have access to.
+    """
+    identity = ctx.obj["identity"]
+
+    # Find which project owns this sprint.
+    projects_data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/",
+        identity=identity,
+    )
+    projects = projects_data.get("results", projects_data) if isinstance(projects_data, dict) else projects_data
+
+    headers = get_auth_headers(identity)
+    sprint_data = None
+    project_uuid = None
+    project_ident = None
+    for p in projects:
+        if not p.get("is_member"):
+            continue
+        r = httpx.get(
+            f"{PLANE_API_URL}/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{p['id']}/cycles/{sprint_id}/",
+            headers=headers,
+            timeout=15.0,
+        )
+        if r.status_code == 200:
+            sprint_data = r.json()
+            project_uuid = p["id"]
+            project_ident = p["identifier"]
+            break
+    if not sprint_data:
+        raise click.ClickException(f"sprint {sprint_id} not found in any project you can see")
+
+    # Tickets in sprint (cycle-issues returns full issue records).
+    in_cycle_data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/cycles/{sprint_id}/cycle-issues/",
+        identity=identity,
+    )
+    tickets = in_cycle_data.get("results", in_cycle_data) if isinstance(in_cycle_data, dict) else in_cycle_data
+
+    # Resolve state names.
+    states_data = api_call(
+        "GET",
+        f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/states/",
+        identity=identity,
+    )
+    states = states_data.get("results", states_data) if isinstance(states_data, dict) else states_data
+    state_name = {s["id"]: s["name"] for s in states}
+
+    # Comment count per ticket (one GET each — O(N) but sprints are small).
+    ticket_rows = []
+    for t in tickets:
+        comments = api_call(
+            "GET",
+            f"/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{project_uuid}/issues/{t['id']}/comments/",
+            identity=identity,
+        )
+        c_list = comments.get("results", comments) if isinstance(comments, dict) else comments
+        ticket_rows.append({
+            "ticket": f"{project_ident}-{t['sequence_id']}",
+            "name": t["name"],
+            "state": state_name.get(t.get("state"), t.get("state")),
+            "comments": len(c_list),
+            # estimate_point is a FK to EstimatePoint; resolves to human-readable
+            # once estimate scale is configured (see MGMT-6).
+            "estimate": t.get("estimate_point"),
+        })
+
+    emit(
+        {
+            "sprint": sprint_data["name"],
+            "id": sprint_id,
+            "project": project_ident,
+            "start": (sprint_data.get("start_date") or "")[:10],
+            "end": (sprint_data.get("end_date") or "")[:10],
+            "tickets": ticket_rows,
+            "total_estimate": sum_estimates(tickets),
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+# --- auth commands ------------------------------------------------------
+
+@auth.command("init")
+@click.option("--force", is_flag=True, help="Re-mint even if a PAT is already stored.")
+@click.pass_context
+def auth_init(ctx: click.Context, force: bool) -> None:
+    """Bootstrap Plane credentials via OIDC and store a permanent PAT.
+
+    Drives the OIDC auth-code flow using your Dex credentials from
+    identity.env, mints a never-expiring Plane PAT, and writes it to
+    ~/.agents/<email>/plane.pat. Run once per host per agent.
+    """
+    identity = ctx.obj["identity"]
+    email = ctx.obj["identity_email"]
+    pat_path = Path.home() / ".agents" / email / "plane.pat"
+
+    if pat_path.is_file() and not force:
+        raise click.ClickException(
+            f"PAT already present at {pat_path}. Use --force to re-mint."
+        )
+
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30.0) as c:
+            # Kick off OIDC at Plane and follow redirects into Dex's login form.
+            r = c.get(f"{PLANE_API_URL}/auth/oidc/")
+            if "/auth/local/login" not in str(r.url):
+                raise click.ClickException(
+                    f"expected Dex login form, landed at {r.url}"
+                )
+
+            # POST credentials; httpx follows through Plane's callback to the landing page.
+            r = c.post(
+                str(r.url),
+                data={"login": email, "password": identity["AGENT_PASSWORD"]},
+            )
+            if r.status_code != 200:
+                raise click.ClickException(
+                    f"post-login landing returned {r.status_code}: {r.text[:200]}"
+                )
+            csrf = c.cookies.get("csrftoken")
+            if not csrf:
+                raise click.ClickException("csrftoken cookie missing after login")
+
+            session_headers = {"X-CSRFToken": csrf, "Referer": f"{PLANE_API_URL}/"}
+
+            # Mark the user as fully onboarded so workspace admins can see them in
+            # member pickers. Without this, Plane treats the user as mid-wizard
+            # and hides them from admin UIs.
+            r = c.patch(
+                f"{PLANE_API_URL}/api/users/me/onboard/",
+                json={"is_onboarded": True},
+                headers=session_headers,
+            )
+            if r.status_code != 200:
+                raise click.ClickException(
+                    f"onboarding mark failed ({r.status_code}): {r.text[:200]}"
+                )
+
+            # Mint a never-expiring PAT via the authenticated session.
+            r = c.post(
+                f"{PLANE_API_URL}/api/users/api-tokens/",
+                json={
+                    "label": "agent-tracker",
+                    "description": f"permanent PAT for agent-tracker ({email})",
+                    "expired_at": None,
+                },
+                headers=session_headers,
+            )
+            if r.status_code != 201:
+                raise click.ClickException(
+                    f"PAT creation failed ({r.status_code}): {r.text[:300]}"
+                )
+            pat_data = r.json()
+            token = pat_data["token"]
+            user_uuid = pat_data["user"]
+    except httpx.HTTPError as e:
+        raise click.ClickException(f"auth init failed: {e}") from e
+
+    pat_path.parent.mkdir(parents=True, exist_ok=True)
+    pat_path.parent.chmod(0o700)
+    pat_path.write_text(token + "\n")
+    pat_path.chmod(0o600)
+
+    # Grant project membership based on identity-derived project identifier.
+    # Uses the embedded admin PAT (never exposed to agent context). Silent no-op
+    # if the derived project doesn't exist (cross-project agents, humans). Any
+    # failure here warns but doesn't raise — the agent's own PAT is already
+    # persisted and ticket reads are still usable once a project member manually
+    # adds them.
+    grant_note = _grant_project_membership(email, token, user_uuid)
+
+    emit(
+        {
+            "status": "bootstrap complete",
+            "identity": email,
+            "pat_file": str(pat_path),
+            "token_preview": token[:20] + "…",
+            "project_grant": grant_note,
+        },
+        as_json=ctx.obj["as_json"],
+    )
+
+
+def _grant_project_membership(email: str, agent_pat: str, user_uuid: str) -> str:
+    """Grant the agent membership on their identity-derived project.
+
+    Returns a short status string for inclusion in the auth-init summary.
+    Warns on failure but never raises.
+    """
+    if not PLANE_ADMIN_PAT:
+        click.echo(
+            "warn: PLANE_ADMIN_PAT not configured; skipping project-membership grant.\n"
+            "      ask infra.ops for the workspace-admin PAT and update ~/bin/agent-tracker.",
+            err=True,
+        )
+        return "skipped (no admin PAT)"
+
+    project_ident = email.split("@", 1)[0].split(".", 1)[0].upper()
+    try:
+        r = httpx.get(
+            f"{PLANE_API_URL}/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/",
+            headers={"X-Api-Key": agent_pat},
+            timeout=15.0,
+        )
+        if r.status_code != 200:
+            click.echo(
+                f"warn: project list failed ({r.status_code}): {r.text[:200]}",
+                err=True,
+            )
+            return f"failed (list {r.status_code})"
+
+        data = r.json()
+        projects = data.get("results", data) if isinstance(data, dict) else data
+        match = next(
+            (p for p in projects if p.get("identifier") == project_ident), None
+        )
+        if not match:
+            return f"no match for {project_ident} (no-op)"
+
+        r = httpx.post(
+            f"{PLANE_API_URL}/api/v1/workspaces/{DEFAULT_WORKSPACE_SLUG}/projects/{match['id']}/members/",
+            json={"member": user_uuid, "role": 15},
+            headers={"X-Api-Key": PLANE_ADMIN_PAT},
+            timeout=15.0,
+        )
+        if r.status_code == 201:
+            return f"granted on {project_ident}"
+        click.echo(
+            f"warn: project grant returned {r.status_code}: {r.text[:200]}",
+            err=True,
+        )
+        return f"grant {r.status_code}"
+    except httpx.HTTPError as e:
+        click.echo(f"warn: project grant exception: {e}", err=True)
+        return "exception"
+
+
+if __name__ == "__main__":
+    cli()

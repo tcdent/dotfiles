@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# agent-message: messaging primitives for Claude Code instances in tmux
+#
+# Usage:
+#   agent-message whoami                  # print your tmux address
+#   agent-message dir [workspace|global]  # list panes (default: workspace)
+#   agent-message send <addr> <message>   # send a message to a pane
+#
+# Addressing uses tmux semantics: session:window.pane (e.g. cat:2.6)
+
+set -euo pipefail
+
+# --- Helpers ---
+
+die() { echo "error: $*" >&2; exit 1; }
+
+get_self() {
+  [[ -z "${TMUX_PANE:-}" ]] && die "not running inside tmux"
+  tmux display-message -p -t "$TMUX_PANE" "#{session_name}:#{window_index}.#{pane_index}"
+}
+
+get_session() {
+  [[ -z "${TMUX_PANE:-}" ]] && die "not running inside tmux"
+  tmux display-message -p -t "$TMUX_PANE" "#{session_name}"
+}
+
+# Forward lookup: identity (email) → tmux address
+# Scans pane_title across all panes; returns empty string if no match.
+lookup_identity() {
+  local id="$1"
+  local addr=""
+  while IFS=$'\t' read -r a t; do
+    if [[ "$t" == *"$id"* ]]; then
+      addr="$a"
+      break
+    fi
+  done < <(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}	#{pane_title}")
+  echo "$addr"
+}
+
+# Extract an agent identity from a pane_title string; empty if none.
+# The `|| true` swallows grep's non-zero exit when no match is found
+# (otherwise set -euo pipefail would abort the caller).
+identity_from_title() {
+  echo "$1" | grep -oE '[a-zA-Z0-9._-]+@a10k\.internal' | head -1 || true
+}
+
+# Reverse lookup: tmux address → identity (email).
+#
+# Mirrors resolve_target's branch structure:
+#   1. Explicit address aliases (e.g. two:2.1 → two@a10k.co). Kept in sync
+#      with the forward aliases in resolve_target — any new cross-org entry
+#      lands in both places.
+#   2. Standard path: extract @a10k.internal identity from pane_title via
+#      identity_from_title.
+# Returns empty string if neither matches.
+reverse_identity() {
+  local target="$1"
+
+  # Resolve to session:window.pane form for stable address matching,
+  # regardless of whether caller passed $TMUX_PANE or a pre-resolved address.
+  local addr
+  addr=$(tmux display-message -p -t "$target" "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null || true)
+
+  case "$addr" in
+    two:2.1) echo "two@a10k.co"; return 0 ;;
+  esac
+
+  local title
+  title=$(tmux display-message -p -t "$target" "#{pane_title}" 2>/dev/null || true)
+  identity_from_title "$title"
+}
+
+# Prefer the sender's identity for attribution; fall back to tmux address if
+# the pane isn't tagged with an identity.
+get_self_identity() {
+  [[ -z "${TMUX_PANE:-}" ]] && die "not running inside tmux"
+  local id
+  id=$(reverse_identity "$TMUX_PANE")
+  if [[ -n "$id" ]]; then
+    echo "$id"
+  else
+    get_self
+  fi
+}
+
+# Escape a message for safe delivery via tmux send-keys.
+# Returns non-zero if the message contains sequences we can't safely escape.
+escape_message() {
+  local msg="$1"
+
+  # Reject messages containing raw escape sequences (tmux control codes)
+  if [[ "$msg" =~ $'\e' ]]; then
+    die "message contains escape sequences that cannot be safely sent"
+  fi
+
+  # tmux send-keys with a quoted string handles most things fine.
+  # We need to escape:
+  #   - backslashes (double them)
+  #   - double quotes (backslash-escape)
+  #   - dollar signs (prevent shell expansion in recipient)
+  #   - backticks (prevent command substitution)
+  msg="${msg//\\/\\\\}"
+  msg="${msg//\"/\\\"}"
+  msg="${msg//\$/\\\$}"
+  msg="${msg//\`/\\\`}"
+
+  printf '%s' "$msg"
+}
+
+# Check whether a target pane is ready to receive a message.
+#
+# For Claude panes, we look for the text entry prompt (❯ followed by an
+# empty/whitespace-only line). This is the only state where the agent is
+# ready to accept input. Any other state — approval dialogs, mid-tool-use,
+# user composing — means the agent is busy.
+#
+# Non-Claude panes are always considered ready.
+#
+# TODO: Consider distinguishing "user is composing" from "agent is busy"
+# TODO: Test behavior when agent is mid-tool-use with auto-approve
+check_target_ready() {
+  local target="$1"
+
+  local target_cmd
+  target_cmd=$(tmux display-message -t "$target" -p "#{pane_current_command}")
+
+  # Only check Claude panes — non-Claude panes are always ready
+  [[ "$target_cmd" != "claude" ]] && return 0
+
+  # Capture the visible pane, strip trailing blank lines, check the last 10
+  # lines for the prompt canary.
+  #
+  # Byte signatures:
+  #   Empty prompt (ready):   e2 9d af  c2 a0  [20|0a]  → ❯ + NBSP + (space or EOL)
+  #   User composing (busy):  e2 9d af  c2 a0  [text]   → ❯ + NBSP + typed chars
+  #   Sent message (history): e2 9d af  20     [text]   → ❯ + regular space + text
+  #
+  # Pattern: ^❯\x{00a0}($| )
+  #   - Matches only the live input prompt (NBSP distinguishes from history)
+  #   - EOL or space after NBSP = empty prompt, ready to receive
+  #   - Text after NBSP = user is composing, block delivery
+  #   - Convention: a leading space in user input is treated as "empty" (allows
+  #     agents to deliver even when user has started but wants to yield)
+  local pane_content
+  pane_content=$(tmux capture-pane -t "$target" -p | sed -e :a -e '/^[[:space:]]*$/{ $d; N; ba; }')
+
+  if echo "$pane_content" | tail -10 | grep -qP '^❯\x{00a0}($| )'; then
+    return 0
+  fi
+
+  die "target is not ready to receive - no data was sent - backoff and try again shortly"
+}
+
+# Resolve a target address to a concrete tmux address (session:window.pane).
+# Accepts three formats:
+#   session:window.pane            — tmux address, pass-through
+#   <id>@a10k.internal             — agent identity; look up by pane_title substring
+#   two@a10k.co                    — hardcoded alias → two:2.1
+resolve_target() {
+  local target="$1"
+
+  # Already a tmux address
+  if [[ "$target" =~ ^[^@]+:[0-9]+\.[0-9]+$ ]]; then
+    echo "$target"
+    return 0
+  fi
+
+  # Hardcoded aliases for cross-org routing
+  case "$target" in
+    two@a10k.co) echo "two:2.1"; return 0 ;;
+  esac
+
+  # Agent identity — look up the pane tagged with this identity.
+  # pane_title is updated by Claude Code's auto-title mechanism from the session
+  # name, so renamed panes are discoverable (e.g. "⠂ mgmt.arch@a10k.internal").
+  if [[ "$target" == *"@a10k.internal" ]]; then
+    local addr
+    addr=$(lookup_identity "$target")
+    [[ -n "$addr" ]] || die "no live pane found for identity '$target'"
+    echo "$addr"
+    return 0
+  fi
+
+  die "unrecognized target format: '$target' (expected session:window.pane, <id>@a10k.internal, or two@a10k.co)"
+}
+
+# --- Commands ---
+
+cmd_whoami() {
+  get_self_identity
+}
+
+cmd_dir() {
+  local scope="${1:-workspace}"
+  local self
+  self=$(get_self)
+
+  local pane_list
+  case "$scope" in
+    workspace)
+      local session
+      session=$(get_session)
+      pane_list=$(tmux list-panes -s -t "$session" \
+        -F "#{session_name}:#{window_index}.#{pane_index}	#{pane_current_command}	#{pane_title}")
+      ;;
+    global)
+      pane_list=$(tmux list-panes -a \
+        -F "#{session_name}:#{window_index}.#{pane_index}	#{pane_current_command}	#{pane_title}")
+      ;;
+    *)
+      die "unknown scope: $scope (use 'workspace' or 'global')"
+      ;;
+  esac
+
+  [[ -z "$pane_list" ]] && die "no panes found"
+
+  while IFS=$'\t' read -r addr cmd title; do
+    local marker=""
+    [[ "$addr" == "$self" ]] && marker=" (you)"
+
+    # Prefer identity when the pane is tagged with one; fall back to tmux address.
+    local display_addr
+    display_addr=$(identity_from_title "$title")
+    [[ -z "$display_addr" ]] && display_addr="$addr"
+
+    printf "  %-36s %s%s\n" "$display_addr" "$cmd" "$marker"
+  done <<< "$pane_list"
+}
+
+cmd_send() {
+  local target="${1:-}"
+  local message="${2:-}"
+
+  [[ -z "$target" ]] && die "usage: agent-message send <addr> <message>"
+  [[ -z "$message" ]] && die "usage: agent-message send <addr> <message>"
+
+  # Preserve what the sender typed for the envelope's "to" field — we want
+  # recipients to see who they were addressed as, not just where they live.
+  local target_display="$target"
+
+  # Resolve identity / alias to tmux address for delivery
+  target=$(resolve_target "$target")
+
+  # Validate target pane exists
+  if ! tmux has-session -t "${target%%:*}" 2>/dev/null; then
+    die "session '${target%%:*}' not found"
+  fi
+
+  # Validate the specific pane exists
+  if ! tmux display-message -t "$target" -p "" 2>/dev/null; then
+    die "pane '$target' not found"
+  fi
+
+  # Check if the target can accept a message
+  check_target_ready "$target"
+
+  # Escape the message
+  local escaped
+  escaped=$(escape_message "$message")
+
+  # Identify sender by identity if available, tmux address otherwise
+  local self
+  self=$(get_self_identity)
+
+  # Build the envelope: from->to prefix, using identities for both sides
+  local envelope="[$self->$target_display] $escaped"
+
+  # Send via tmux send-keys as a single string + Enter
+  tmux send-keys -t "$target" "$envelope" Enter
+
+  # Brief pause to let tmux process the message before the safety enter.
+  # Without this, the trailing enter can arrive before the message is fully
+  # rendered in the target pane, causing submission to fail on long messages.
+  sleep 0.2
+
+  # Safety enter — ensures submission for long/multiline messages
+  tmux send-keys -t "$target" "" Enter
+}
+
+# --- Main ---
+
+case "${1:-}" in
+  whoami) cmd_whoami ;;
+  dir)    cmd_dir "${2:-workspace}" ;;
+  send)   cmd_send "${2:-}" "${3:-}" ;;
+  -h|--help|help|"")
+    cat <<EOF
+Usage:
+  agent-message whoami                     Print your identity (or tmux address if untagged)
+  agent-message dir [workspace|global]     List panes — identity shown when present, tmux address otherwise
+  agent-message send <target> <message>    Send a message to a peer
+
+Address formats accepted by send:
+  <identity>@a10k.internal                 agent identity (preferred)
+  session:window.pane                      tmux address (e.g. mgmt:2.7)
+  two@a10k.co                              cross-org alias
+
+Examples:
+  agent-message send mgmt.design@a10k.internal "can you review ticket ABC-42?"
+  agent-message send mgmt:2.4 "tail the build log and report back"
+EOF
+    ;;
+  *)
+    die "unknown command: $1"
+    ;;
+esac

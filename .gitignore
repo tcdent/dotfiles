@@ -28,3 +28,4 @@ irssi/logs/
 # And these files
 !.gitignore
 !README.md
+agent-tracker/secrets.env

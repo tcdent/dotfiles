@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# agent-register: self-register as a Dex identity and stage creds for this host.
+#
+# Usage:
+#   agent-register <identity>             # register a new identity
+#   agent-register --restore <identity>   # reset the password for an existing identity
+#                                         # (preserves user_id, and thus historical attribution)
+#
+# Creates ~/.agents/<identity>@a10k.internal/identity.env with credentials that
+# identify this agent to Dex. After running, launch Claude Code with:
+#   claude --name "<identity>@a10k.internal"
+#
+# System deps (installed once, not bootstrapped by this script):
+#   grpcurl      brew install grpcurl
+#   uv           curl -LsSf https://astral.sh/uv/install.sh | sh
+#   curl, openssl, python3
+#
+# Proto file expected at ~/.config/bin/dex.proto:
+#   curl -LsSf -o ~/.config/bin/dex.proto https://raw.githubusercontent.com/dexidp/dex/master/api/v2/api.proto
+#
+# Design context: ~/Work/mgmt/research/03-identity.md
+
+set -euo pipefail
+
+# --- embedded config ---
+DEX_GRPC="192.168.88.3:5557"
+DEX_ISSUER="https://id.a10k.co"
+DOMAIN="a10k.internal"
+PROTO="$HOME/.config/bin/dex.proto"
+
+# agent-cli OAuth client — provisioned once in Dex, shared by all agents for ROPC.
+# Secret loaded from a gitignored file since ~/.config is a public repo.
+CLIENT_ID="agent-cli"
+SECRETS_FILE="$HOME/.config/agent-tracker/secrets.env"
+[[ -r "$SECRETS_FILE" ]] || { echo "error: $SECRETS_FILE not found (owner-readable expected)" >&2; exit 3; }
+# shellcheck source=/dev/null
+source "$SECRETS_FILE"
+CLIENT_SECRET="${AGENT_CLI_SECRET:?AGENT_CLI_SECRET missing in $SECRETS_FILE}"
+
+# --- parse args ---
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+  cat <<EOF
+Usage:
+  agent-register <identity>             Register a new identity (e.g. mgmt.arch)
+  agent-register --restore <identity>   Reset password for an existing identity
+  agent-register -h | --help            Show this message
+
+Registers <identity>@a10k.internal as an agent in the directory and stages
+credentials on this host. When run inside a Claude Code session, the session
+is automatically renamed to match.
+
+Use --restore if you're re-provisioning on a new host or lost local credentials
+— it preserves history (tickets, comments, audit trail) by keeping the same
+user id.
+EOF
+  exit 0
+fi
+
+RESTORE=0
+IDENTITY=""
+# Position-agnostic arg parsing so flags work in any order.
+# --domain is deliberately undocumented (rare cross-domain cases only).
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --restore)
+      RESTORE=1
+      shift
+      ;;
+    --domain)
+      DOMAIN="${2:?--domain requires a value}"
+      shift 2
+      ;;
+    --domain=*)
+      DOMAIN="${1#*=}"
+      shift
+      ;;
+    -*)
+      echo "error: unknown flag $1" >&2
+      exit 1
+      ;;
+    *)
+      [[ -n "$IDENTITY" ]] && { echo "error: multiple identities given: $IDENTITY, $1" >&2; exit 1; }
+      IDENTITY="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$IDENTITY" ]] || { echo "usage: agent-register [--restore] <identity>  (e.g. mgmt.arch)" >&2; exit 1; }
+EMAIL="${IDENTITY}@${DOMAIN}"
+AGENT_DIR="$HOME/.agents/$EMAIL"
+IDENTITY_FILE="$AGENT_DIR/identity.env"
+
+[[ -r "$PROTO" ]] || {
+  echo "error: Dex proto not found at $PROTO" >&2
+  echo "       fetch: curl -LsSf -o $PROTO https://raw.githubusercontent.com/dexidp/dex/master/api/v2/api.proto" >&2
+  exit 1
+}
+
+[[ -e "$IDENTITY_FILE" ]] && {
+  echo "$EMAIL is already registered on this host." >&2
+  echo "  identity file: $IDENTITY_FILE" >&2
+  exit 1
+}
+
+# --- helpers ---
+grpcall() {
+  grpcurl -plaintext -import-path "$(dirname "$PROTO")" -proto "$(basename "$PROTO")" \
+    -d "$2" "$DEX_GRPC" "$1"
+}
+
+identity_exists_in_dex() {
+  grpcall api.Dex/ListPasswords "{}" \
+    | python3 -c "
+import json, sys
+data = json.load(sys.stdin).get('passwords', [])
+print(next((p['userId'] for p in data if p['email'] == '$EMAIL'), ''))
+"
+}
+
+# --- generate fresh creds ---
+PASSWORD=$(openssl rand -base64 24 | tr -d '+/=')
+HASH_B64=$(uv run --quiet --with bcrypt --no-project -- python3 -c '
+import bcrypt, base64, sys
+h = bcrypt.hashpw(sys.argv[1].encode(), bcrypt.gensalt(rounds=10))
+print(base64.b64encode(h).decode())
+' "$PASSWORD")
+
+# --- register or restore ---
+existing_user_id=$(identity_exists_in_dex)
+
+if [[ -n "$existing_user_id" && $RESTORE -eq 0 ]]; then
+  echo ""
+  echo "$EMAIL is already taken."
+  echo ""
+  echo "if this is your identity and you've lost local credentials, you can restore it"
+  echo "by resetting the password. restoring preserves user_id, which means all historical"
+  echo "attribution (tickets, comments, audit trail) stays intact."
+  echo ""
+  if [[ -t 0 ]]; then
+    read -r -p "did you intend to restore $EMAIL? [y/N] " confirm
+    [[ "$confirm" == [yY]* ]] || { echo "aborted."; exit 1; }
+    RESTORE=1
+  else
+    echo "to restore, re-run with: agent-register --restore $IDENTITY" >&2
+    exit 1
+  fi
+fi
+
+if [[ $RESTORE -eq 1 ]]; then
+  if [[ -z "$existing_user_id" ]]; then
+    echo "error: --restore requested but $EMAIL does not exist in Dex" >&2
+    exit 1
+  fi
+  USER_ID="$existing_user_id"
+  echo "restoring $EMAIL (preserving user_id=$USER_ID)..."
+  UPDATE_PAYLOAD=$(python3 -c "
+import json
+print(json.dumps({
+  'email': '$EMAIL',
+  'new_hash': '$HASH_B64',
+  'new_username': '$IDENTITY',
+}))
+")
+  grpcall api.Dex/UpdatePassword "$UPDATE_PAYLOAD" >/dev/null
+else
+  USER_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  echo "registering $EMAIL (user_id=$USER_ID)..."
+  CREATE_PAYLOAD=$(python3 -c "
+import json
+print(json.dumps({'password': {
+  'email': '$EMAIL',
+  'hash': '$HASH_B64',
+  'username': '$IDENTITY',
+  'user_id': '$USER_ID',
+}}))
+")
+  grpcall api.Dex/CreatePassword "$CREATE_PAYLOAD" >/dev/null
+fi
+
+# --- write identity.env ---
+mkdir -p "$AGENT_DIR"
+chmod 0700 "$AGENT_DIR"
+umask 077
+cat > "$IDENTITY_FILE" <<EOF
+# $EMAIL — Dex-issued credentials
+AGENT_EMAIL=$EMAIL
+AGENT_USER_ID=$USER_ID
+AGENT_PASSWORD=$PASSWORD
+DEX_ISSUER=$DEX_ISSUER
+EOF
+
+echo ""
+echo "  identity file: $IDENTITY_FILE"
+
+# If we're running inside a Claude Code session in tmux, claim this identity
+# for the current session by queuing /rename to our own pane. The keystrokes
+# land at Claude Code's input prompt when the current turn ends, triggering
+# the slash command. Propagates to the iOS app the same as a manual /rename.
+if [[ -n "${CLAUDECODE:-}" && -n "${TMUX_PANE:-}" ]]; then
+  tmux send-keys -t "$TMUX_PANE" "/rename $EMAIL" Enter
+  echo ""
+  echo "queued /rename to this Claude Code session — name will update when the current turn ends."
+else
+  echo ""
+  echo "launch Claude Code with this identity:"
+  echo "  claude --name '$EMAIL'"
+fi
