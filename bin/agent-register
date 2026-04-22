@@ -25,8 +25,36 @@ set -euo pipefail
 # --- embedded config ---
 DEX_GRPC="192.168.88.3:5557"
 DEX_ISSUER="https://id.a10k.co"
-DOMAIN="a10k.internal"
 PROTO="$HOME/.config/bin/dex.proto"
+
+# Default domain comes from the agent-message hosts file's 'localhost'
+# self-entry — each host's operator picks its domain there. If that file
+# is missing or has no self-entry, fail fast (operator error; don't
+# silently default). --domain is still honored as an explicit override.
+HOSTS_FILE="${AGENT_MESSAGE_HOSTS:-$HOME/.config/agent-message/hosts}"
+derive_domain_from_hosts() {
+  [[ -r "$HOSTS_FILE" ]] || return 0
+  local line user_host rest
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    read -r user_host rest <<< "$line"
+    if [[ "$user_host" == "localhost" && -n "$rest" ]]; then
+      printf '%s' "${rest%% *}"
+      return 0
+    fi
+  done < "$HOSTS_FILE"
+}
+
+DOMAIN=$(derive_domain_from_hosts)
+[[ -n "$DOMAIN" ]] || {
+  echo "error: could not derive domain from $HOSTS_FILE" >&2
+  echo "  expected a line like: 'localhost  <your-domain>'" >&2
+  echo "  (or pass --domain <name> to override)" >&2
+  exit 1
+}
 
 # agent-cli OAuth client — provisioned once in Dex, shared by all agents for ROPC.
 # Secret loaded from a gitignored file since ~/.config is a public repo.

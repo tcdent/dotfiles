@@ -20,23 +20,28 @@ die() { echo "error: $*" >&2; exit 1; }
 
 # --- Cross-host routing ---
 #
-# The hosts file lists REMOTE hosts only — one entry per line, mapping
-# identity-domain suffixes to the user@host[:port] that owns them:
+# The hosts file is the single source of truth for where each domain lives,
+# INCLUDING this host. Every reachable domain must be enumerated; an
+# unlisted domain on an identity send is treated as a typo, not an implicit
+# local route.
 #
-#   <user@host[:port]>  <domain1> [domain2 ...]
+# Format (one entry per line, '#' introduces comments):
+#
+#   <user@host[:port] | localhost>  <domain1> [domain2 ...]
+#
+# This host's self-entry uses the literal token 'localhost' in column 1 and
+# MUST be present — missing → fail fast. Remote entries use an SSH target
+# string with an optional port.
 #
 # Examples:
+#   localhost                 a10k.internal
 #   slomp@host2.local         otherdomain.internal
 #   slomp@host3.local:2222    third.internal                # nonstandard SSH port
-#
-# By convention the local host is never in the file. If a target's domain
-# matches an entry, delivery takes the SSH branch; otherwise resolution
-# falls through to local lookup. No local-vs-remote detection is needed.
 
 declare -A HOST_FOR_DOMAIN=()
 
 load_hosts() {
-  [[ ! -r "$HOSTS_FILE" ]] && return 0
+  [[ ! -r "$HOSTS_FILE" ]] && die "hosts file missing: $HOSTS_FILE"
   local line user_host rest d
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%#*}"
@@ -46,12 +51,21 @@ load_hosts() {
 
     read -r user_host rest <<< "$line"
     [[ -z "$user_host" || -z "$rest" ]] && continue
-    [[ "$user_host" != *"@"* ]] && continue
+    # Accept literal 'localhost' for the self-entry, or user@host[:port] for remote.
+    [[ "$user_host" == "localhost" || "$user_host" == *"@"* ]] || continue
 
     for d in $rest; do
       HOST_FOR_DOMAIN["$d"]="$user_host"
     done
   done < "$HOSTS_FILE"
+
+  # Require a self-entry. Without it, identity routing has no way to
+  # decide "stays here" vs "is a typo".
+  local uh has_local=0
+  for uh in "${HOST_FOR_DOMAIN[@]}"; do
+    [[ "$uh" == "localhost" ]] && { has_local=1; break; }
+  done
+  [[ $has_local -eq 1 ]] || die "hosts file has no 'localhost' self-entry: $HOSTS_FILE"
 }
 
 load_hosts
@@ -199,12 +213,13 @@ check_target_ready() {
 #
 # Accepts:
 #   session:window.pane            — tmux address, pass-through (always local)
-#   <id>@<domain>                  — if the domain routes to a non-local host
-#                                    per the hosts file, returns
-#                                    REMOTE:<user@host>; otherwise falls
-#                                    through to local lookup
 #   two@a10k.co                    — hardcoded within-host alias → two:2.1
-#   <id>@a10k.internal             — agent identity looked up by pane_title
+#   <id>@<domain>                  — the domain MUST be in the hosts file.
+#                                    If its entry is 'localhost', looks up
+#                                    the pane on our tmux server. If it's a
+#                                    remote user@host[:port], returns
+#                                    REMOTE:<endpoint>. An unknown domain
+#                                    fails with a typo-catcher error.
 resolve_target() {
   local target="$1"
 
@@ -214,37 +229,34 @@ resolve_target() {
     return 0
   fi
 
-  # Cross-host routing: if the target's domain has a hosts-file entry, the
-  # target lives on another machine by convention (local is never in the
-  # file). Runs BEFORE local aliases and identity lookup so we don't try to
-  # resolve an identity against our tmux server when it lives elsewhere.
-  if [[ "$target" == *"@"* ]]; then
-    local domain="${target#*@}"
-    local user_host="${HOST_FOR_DOMAIN[$domain]:-}"
-    if [[ -n "$user_host" ]]; then
-      echo "REMOTE:$user_host"
-      return 0
-    fi
-  fi
-
-  # Hardcoded local aliases — describe within-host shortcuts. They only
-  # fire when the domain wasn't in the hosts file (i.e. routes locally).
+  # Hardcoded aliases — hardcoded tmux-pane shortcuts that aren't domain-routed.
+  # Checked before the hosts-file lookup so alias semantics stay stable regardless
+  # of what the file says about their notional domain.
   case "$target" in
     two@a10k.co) echo "two:2.1"; return 0 ;;
   esac
 
-  # Agent identity — look up the pane tagged with this identity.
-  # pane_title is updated by Claude Code's auto-title mechanism from the session
-  # name, so renamed panes are discoverable (e.g. "⠂ mgmt.arch@a10k.internal").
-  if [[ "$target" == *"@a10k.internal" ]]; then
-    local addr
-    addr=$(lookup_identity "$target")
-    [[ -n "$addr" ]] || die "no live pane found for identity '$target'"
-    echo "$addr"
+  # Identity by domain. The hosts file is the source of truth for all
+  # reachable domains, including this host (via the 'localhost' entry).
+  # Unknown domain => typo; we don't silently fall through to local lookup.
+  if [[ "$target" == *"@"* ]]; then
+    local domain="${target#*@}"
+    local user_host="${HOST_FOR_DOMAIN[$domain]:-}"
+    [[ -n "$user_host" ]] || die "unknown domain '$domain' in target '$target' — add it to $HOSTS_FILE or check for a typo"
+
+    if [[ "$user_host" == "localhost" ]]; then
+      local addr
+      addr=$(lookup_identity "$target")
+      [[ -n "$addr" ]] || die "no live pane found for identity '$target'"
+      echo "$addr"
+      return 0
+    fi
+
+    echo "REMOTE:$user_host"
     return 0
   fi
 
-  die "unrecognized target format: '$target' (expected session:window.pane, <id>@a10k.internal, or two@a10k.co)"
+  die "unrecognized target format: '$target' (expected session:window.pane, <id>@<domain>, or two@a10k.co)"
 }
 
 # --- Commands ---
@@ -345,10 +357,10 @@ dump_remote_dir() {
   printf '%s\n' "$dir_out" | prefix_rows "$host_label"
 }
 
-# 'dir network' — third-tier scope. Emits the local tmux server first (so
-# the "(you)" marker anchors on our pane), then fans out to every remote
-# host in the hosts file. Local is never in the file by convention, so no
-# dedup is needed.
+# 'dir network' — third-tier scope. Emits the 'localhost' self-entry's
+# panes first (so the "(you)" marker anchors on our pane), then fans out
+# to every remote host in the hosts file. The local block comes from
+# cmd_dir global in-process; remote blocks come from SSH.
 cmd_dir_network() {
   local local_label
   local_label=$(hostname)
@@ -357,8 +369,12 @@ cmd_dir_network() {
 
   cmd_dir global | prefix_rows "$local_label"
 
-  local uh
+  # Already emitted the localhost self-entry above; skip it in the remote
+  # loop. SEEN also deduplicates remote entries that route several domains
+  # to the same user@host.
   declare -A SEEN=()
+  SEEN[localhost]=1
+  local uh
   for uh in "${HOST_FOR_DOMAIN[@]}"; do
     [[ -n "${SEEN[$uh]:-}" ]] && continue
     SEEN[$uh]=1
