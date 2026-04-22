@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# agent-blocked-poll: detect Claude panes blocked on permission prompts.
+#
+# Stateless detector — scans tmux panes running claude, checks for the
+# approval-prompt signature, and emits one line per blocked pane naming
+# what the agent is waiting to approve. Downstream routing (alerts, pings)
+# is out of scope.
+#
+# Scopes mirror agent-message dir:
+#   workspace  current tmux session only
+#   global     every pane on the local tmux server
+#   network    local + every remote host in ~/.config/agent-message/hosts
+#
+# Output (workspace/global):
+#   <identity-or-addr>  <section>  [<description>]
+# Output (network — host column inserted after identity):
+#   <identity-or-addr>  <host>  <section>  [<description>]
+# Diagnostic lines (unreachable remote):
+#   ! <host>: unreachable (<reason>)
+#
+# Exit 0 if nothing blocked, 1 if at least one pane is blocked.
+
+set -euo pipefail
+
+HOSTS_FILE="${AGENT_MESSAGE_HOSTS:-$HOME/.config/agent-message/hosts}"
+
+# Local hostname, normalized the same way dir_network labels it. Used as the
+# 'host' value in JSON records emitted for panes on this machine (workspace
+# and global scopes always populate 'host' with this; network scope overrides
+# via the local_label passed down from cmd_network).
+LOCAL_HOSTNAME="$(hostname)"
+LOCAL_HOSTNAME="${LOCAL_HOSTNAME%.local}"
+LOCAL_HOSTNAME="${LOCAL_HOSTNAME,,}"
+
+JSON_MODE=0
+SCOPE="workspace"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# --- Hosts file parser (network scope only) ---
+
+declare -A HOST_FOR_DOMAIN=()
+
+load_hosts() {
+  [[ ! -r "$HOSTS_FILE" ]] && return 0
+  local line user_host rest d
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    read -r user_host rest <<< "$line"
+    [[ -z "$user_host" || -z "$rest" ]] && continue
+    [[ "$user_host" == "localhost" || "$user_host" == *"@"* ]] || continue
+    for d in $rest; do
+      HOST_FOR_DOMAIN["$d"]="$user_host"
+    done
+  done < "$HOSTS_FILE"
+}
+
+# --- Identity resolution (lifted from agent-message's pane_title scheme) ---
+
+identity_from_title() {
+  printf '%s\n' "$1" | grep -oE '[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+' | head -1 || true
+}
+
+# --- JSON emitters (python3 used for escape safety; jq not available on every host) ---
+#
+# Spec calls for jq, but not every host has it — python3 is already a
+# required dep (agent-register uses it for Dex payload construction) and
+# json.dumps() has identical safety properties. Each helper writes one
+# ndjson record to stdout.
+
+emit_blocked_json() {
+  # args: identity host section description (cmd block on stdin, one line each)
+  local identity="$1" host="$2" section="$3" description="$4"
+  python3 -c '
+import json, sys
+identity, host, section, description = sys.argv[1:5]
+cmd = [line for line in sys.stdin.read().split("\n") if line]
+desc = description if description else None
+print(json.dumps({
+    "type": "blocked",
+    "identity": identity,
+    "host": host,
+    "section": section,
+    "description": desc,
+    "command": cmd,
+}))
+' "$identity" "$host" "$section" "$description"
+}
+
+emit_unreachable_json() {
+  local host="$1" reason="$2"
+  python3 -c '
+import json, sys
+host, reason = sys.argv[1:3]
+print(json.dumps({"type": "unreachable", "host": host, "reason": reason}))
+' "$host" "$reason"
+}
+
+# --- Detector + extractor ---
+#
+# Given a pane's captured content on stdin, emit a TAB-separated pair
+# "<section>\t<description>" and exit 0 when the content shows an approval
+# prompt; exit 1 otherwise. Description may be empty for variants that
+# don't surface a short description line (Write/Edit/MCP — TBD from
+# fixtures as they land).
+#
+# Required anchors (union across all known variants):
+#   - literal 'Do you want to proceed?'
+#   - a line matching ' ❯ [0-9]+\.' AFTER the anchor
+#
+# 'Esc to cancel' is a soft signal, used to tighten confidence but not
+# hard-required. Preferring false-negatives over false-positives per spec.
+detect_blocked() {
+  awk '
+    { lines[NR] = $0 }
+    END {
+      # 1. Find the LAST "Do you want to proceed?" occurrence.
+      q = 0
+      for (i = NR; i >= 1; i--) {
+        if (lines[i] ~ / Do you want to proceed\?/) { q = i; break }
+      }
+      if (!q) exit 1
+
+      # 2. Require a menu-selector line after the anchor.
+      menu = 0
+      for (i = q + 1; i <= NR; i++) {
+        if (lines[i] ~ /^ \xe2\x9d\xaf [0-9]+\./) { menu = i; break }
+      }
+      if (!menu) exit 1
+
+      # 3. Extract structure by walking BACKWARD from the anchor.
+      i = q - 1
+      while (i >= 1 && lines[i] ~ /^[[:space:]]*$/) i--
+      if (i < 1) exit 1
+
+      section = ""
+      desc = ""
+      block_top = 0
+      block_desc_idx = 0  # index of the description line (last line of block)
+
+      if (lines[i] ~ /^   [^ ]/) {
+        # Bash variant: the line above the blank(s) before the question is
+        # the LAST line of the 3-space-indent command block (= description).
+        block_desc_idx = i
+        desc = lines[i]
+        sub(/^   /, "", desc)
+        sub(/[[:space:]]+$/, "", desc)
+        block_top = i
+        i--
+        while (i >= 1 && lines[i] ~ /^   /) { block_top = i; i-- }
+        while (i >= 1 && lines[i] ~ /^[[:space:]]*$/) i--
+      }
+      # Whatever we stopped on (whether we consumed a block or not) should
+      # be the 1-space-indent section header. If it isn'"'"'t, leave section
+      # blank — emit will still give a useful line.
+      if (i >= 1 && lines[i] ~ /^ [^ ]/) {
+        section = lines[i]
+        sub(/^ /, "", section)
+        sub(/[[:space:]]+$/, "", section)
+      }
+
+      # Emit: first line is "<section>\t<description>". Subsequent lines are
+      # the proposed command itself (block lines EXCLUDING the description,
+      # which is the last line of the block). Each command line is output
+      # verbatim minus its leading 3-space indent.
+      printf "%s\t%s\n", section, desc
+      if (block_top > 0 && block_desc_idx > block_top) {
+        for (k = block_top; k < block_desc_idx; k++) {
+          cl = lines[k]
+          sub(/^   /, "", cl)
+          sub(/[[:space:]]+$/, "", cl)
+          printf "%s\n", cl
+        }
+      }
+      exit 0
+    }
+  '
+}
+
+# --- Per-pane check: capture, detect, emit ---
+
+ANY_BLOCKED=0
+
+# check_pane <tmux_addr> <pane_title> [<host_label>]
+# Emits a formatted line on stdout when blocked; sets ANY_BLOCKED=1.
+check_pane() {
+  local pane="$1"
+  local title="$2"
+  local host_label="${3:-}"
+
+  local content parsed
+  # -S -25 captures the visible pane plus the last 25 scrollback lines —
+  # enough to recover the section header when the command block pushes it
+  # above the visible top, while staying small enough that recently-resolved
+  # approvals rarely linger in the window. Active dialogs always sit at the
+  # visible bottom; if the agent has moved past approval, new content
+  # quickly pushes the dialog out of a 25-line scrollback.
+  content=$(tmux capture-pane -t "$pane" -p -S -25 2>/dev/null) || return 0
+
+  if ! parsed=$(printf '%s\n' "$content" | detect_blocked); then
+    return 0
+  fi
+
+  # First line: "<section>\t<description>"
+  # Subsequent lines: the proposed command, one line each
+  local header cmd_block
+  header=$(printf '%s\n' "$parsed" | head -1)
+  cmd_block=$(printf '%s\n' "$parsed" | tail -n +2)
+
+  local section description
+  IFS=$'\t' read -r section description <<< "$header"
+
+  local display_addr
+  display_addr=$(identity_from_title "$title")
+  [[ -z "$display_addr" ]] && display_addr="$pane"
+
+  if [[ $JSON_MODE -eq 1 ]]; then
+    # Host is always populated in JSON; fall back to local hostname when the
+    # scope doesn't set one (workspace/global). One shape across scopes.
+    local effective_host="${host_label:-$LOCAL_HOSTNAME}"
+    emit_blocked_json "$display_addr" "$effective_host" "$section" "$description" <<< "$cmd_block"
+  else
+    # Header line: identity, optional host column, section, optional description
+    if [[ -n "$host_label" ]]; then
+      if [[ -n "$description" ]]; then
+        printf '  %s  %s  %s  %s\n' "$display_addr" "$host_label" "$section" "$description"
+      else
+        printf '  %s  %s  %s\n' "$display_addr" "$host_label" "$section"
+      fi
+    else
+      if [[ -n "$description" ]]; then
+        printf '  %s  %s  %s\n' "$display_addr" "$section" "$description"
+      else
+        printf '  %s  %s\n' "$display_addr" "$section"
+      fi
+    fi
+
+    # Command lines (if any), prefixed with '    | ' so they're visually
+    # distinct from header lines and easy to filter out downstream:
+    #   - header lines:   /^  [^|!]/
+    #   - command lines:  /^    \| /
+    #   - diagnostics:    /^! /
+    if [[ -n "$cmd_block" ]]; then
+      while IFS= read -r cl; do
+        printf '    | %s\n' "$cl"
+      done <<< "$cmd_block"
+    fi
+  fi
+
+  ANY_BLOCKED=1
+}
+
+# --- Scope implementations ---
+
+scan_local() {
+  local scope="$1"
+  local host_label="${2:-}"
+
+  local list_args=(-a)
+  if [[ "$scope" == "workspace" ]]; then
+    [[ -z "${TMUX_PANE:-}" ]] && die "workspace scope requires tmux context"
+    local session
+    session=$(tmux display-message -p -t "$TMUX_PANE" "#{session_name}")
+    list_args=(-s -t "$session")
+  fi
+
+  local addr cmd title
+  while IFS=$'\t' read -r addr cmd title; do
+    [[ "$cmd" != "claude" ]] && continue
+    check_pane "$addr" "$title" "$host_label"
+  done < <(tmux list-panes "${list_args[@]}" \
+              -F "#{session_name}:#{window_index}.#{pane_index}	#{pane_current_command}	#{pane_title}")
+}
+
+scan_remote() {
+  local endpoint="$1"
+  local sshtarget="$endpoint"
+  local port=""
+  if [[ "$endpoint" == *:* ]]; then
+    sshtarget="${endpoint%:*}"
+    port="${endpoint##*:}"
+  fi
+  local host_label="${sshtarget#*@}"
+  host_label="${host_label%.local}"
+
+  local ssh_opts=(-o BatchMode=yes -o ConnectTimeout=5)
+  [[ -n "$port" ]] && ssh_opts+=(-p "$port")
+
+  # Thread --json through to the remote when we're in JSON mode, so the
+  # remote emits ndjson records directly and we don't re-serialize.
+  local remote_cmd=(agent-blocked-poll global)
+  [[ $JSON_MODE -eq 1 ]] && remote_cmd=(agent-blocked-poll --json global)
+
+  local rc=0
+  local out
+  out=$(ssh "${ssh_opts[@]}" "$sshtarget" "${remote_cmd[@]}" 2>&1) || rc=$?
+
+  # Remote's exit is 0 (nothing blocked) or 1 (some blocked); anything else
+  # is an SSH-level failure or the remote tool being missing. Surface those
+  # as a single diagnostic line/record, don't abort.
+  if [[ $rc -eq 0 || $rc -eq 1 ]]; then
+    if [[ -n "$out" ]]; then
+      if [[ $JSON_MODE -eq 1 ]]; then
+        # Remote emits ndjson records already populated with its own host
+        # field. Pass through unchanged.
+        printf '%s\n' "$out"
+      else
+        # Text: remote emits two line shapes:
+        #   header:   "  <addr>  <section>[  <desc>]"   → inject host column
+        #   command:  "    | <cmd-line>"                → pass through verbatim
+        # Also pass through blank lines and '! ' diagnostics as-is.
+        local line id rest
+        while IFS= read -r line; do
+          if [[ "$line" == "    | "* || "$line" == "! "* || -z "$line" ]]; then
+            printf '%s\n' "$line"
+            continue
+          fi
+          line="${line#  }"
+          id="${line%%  *}"
+          rest="${line#*  }"
+          printf '  %s  %s  %s\n' "$id" "$host_label" "$rest"
+        done <<< "$out"
+      fi
+    fi
+    [[ $rc -eq 1 ]] && ANY_BLOCKED=1
+  else
+    local errtxt reason
+    errtxt=$(printf '%s' "$out" | head -1)
+    reason="exit $rc${errtxt:+; $errtxt}"
+    if [[ $JSON_MODE -eq 1 ]]; then
+      emit_unreachable_json "$host_label" "$reason"
+    else
+      printf '! %s: unreachable (%s)\n' "$host_label" "$reason"
+    fi
+  fi
+}
+
+cmd_workspace() { scan_local workspace; }
+cmd_global()    { scan_local global; }
+
+cmd_network() {
+  load_hosts
+
+  local local_label
+  local_label=$(hostname)
+  local_label="${local_label%.local}"
+  local_label="${local_label,,}"
+  scan_local global "$local_label"
+
+  declare -A SEEN=()
+  SEEN[localhost]=1
+  local uh
+  for uh in "${HOST_FOR_DOMAIN[@]}"; do
+    [[ -n "${SEEN[$uh]:-}" ]] && continue
+    SEEN[$uh]=1
+    scan_remote "$uh"
+  done
+}
+
+# --- Main ---
+
+# Position-agnostic arg parsing so 'agent-blocked-poll --json global' and
+# 'agent-blocked-poll global --json' both work.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)
+      JSON_MODE=1
+      shift
+      ;;
+    workspace|global|network)
+      SCOPE="$1"
+      shift
+      ;;
+    -h|--help|help)
+      cat <<'EOF'
+Usage: agent-blocked-poll [--json] [workspace|global|network]
+
+Detects Claude panes blocked on permission prompts; emits one record per
+blocked pane. Default output is text; --json emits ndjson.
+
+Scopes (mirror agent-message dir):
+  workspace  current tmux session
+  global     every pane on the local tmux server
+  network    local + every remote host in ~/.config/agent-message/hosts
+
+Text output:
+  header (workspace/global):  <identity-or-addr>  <section>  [<description>]
+  header (network):           <identity-or-addr>  <host>  <section>  [<description>]
+  command lines (indented):   | <line-of-proposed-command>
+  diagnostic (unreachable):   ! <host>: unreachable (<reason>)
+
+JSON output (one object per line):
+  {"type":"blocked","identity":...,"host":...,"section":...,"description":...|null,"command":[...]}
+  {"type":"unreachable","host":...,"reason":...}
+
+Exit 0 if nothing blocked, 1 if at least one pane is blocked.
+Unreachable diagnostics never push exit to 1.
+EOF
+      exit 0
+      ;;
+    *)
+      die "unknown argument: '$1' (use workspace, global, network, or --json)"
+      ;;
+  esac
+done
+
+case "$SCOPE" in
+  workspace) cmd_workspace ;;
+  global)    cmd_global ;;
+  network)   cmd_network ;;
+esac
+
+exit $ANY_BLOCKED
