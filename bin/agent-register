@@ -130,11 +130,23 @@ IDENTITY_FILE="$AGENT_DIR/identity.env"
   exit 1
 }
 
-[[ -e "$IDENTITY_FILE" ]] && {
-  echo "$EMAIL is already registered on this host." >&2
-  echo "  identity file: $IDENTITY_FILE" >&2
+# Local identity file already exists: block only the bare register path.
+# --restore is explicitly the reprovisioning path — it generates a fresh
+# password, updates Dex, and rewrites identity.env, so overwriting the
+# local file is its normal behavior.
+if [[ -e "$IDENTITY_FILE" && $RESTORE -eq 0 ]]; then
+  cat >&2 <<EOF
+$EMAIL is already registered on this host.
+  identity file: $IDENTITY_FILE
+
+If the credentials there are correct, launch Claude Code with:
+  claude --name $EMAIL
+
+To reprovision (keeps user_id, rewrites the local file):
+  agent-register --restore $IDENTITY
+EOF
   exit 1
-}
+fi
 
 # --- helpers ---
 grpcall() {
