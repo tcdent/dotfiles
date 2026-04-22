@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# agent-session-url: look up an agent's Remote Control URL by identity.
+#
+# Chain (all steps must resolve for a URL to exist):
+#   1. identity → pane address      (tmux pane_title scan)
+#   2. pane → pane_pid + cmd        (must be running claude)
+#   3. pane_pid → claude PID        (self or direct child with comm == claude)
+#   4. claude PID → session UUID    (readlink /proc/<pid>/fd/* → ~/.claude/tasks/)
+#   5. UUID → transcript            (glob ~/.claude/projects/*/<uuid>.jsonl)
+#   6. transcript → bridge_status   (grep, take most recent)
+#
+# Linux-only: step 4 relies on /proc/<pid>/fd. macOS port deferred.
+#
+# Usage:
+#   agent-session-url <agent-id>           Print the URL
+#   agent-session-url <agent-id> --json    Structured metadata
+#
+# <agent-id>: bare (mgmt.arch) or fully-qualified (mgmt.arch@a10k.internal).
+
+set -euo pipefail
+
+PROJECTS_DIR="$HOME/.claude/projects"
+TASKS_DIR="$HOME/.claude/tasks"
+
+die() { echo "error: $*" >&2; exit "${EXIT_CODE:-1}"; }
+
+# 1. identity → pane address (exit 1 on none, exit 1 on multiple)
+find_pane() {
+  local agent="$1" addr title id
+  local matches=()
+  while IFS=$'\t' read -r addr title; do
+    while IFS= read -r id; do
+      [[ -z "$id" ]] && continue
+      # Match either fully-qualified or bare (strip '@domain' from discovered id).
+      if [[ "$agent" == "$id" || "$agent" == "${id%@*}" ]]; then
+        matches+=("$addr")
+        break
+      fi
+    done < <(grep -oE '[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+' <<< "$title" || true)
+  done < <(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}	#{pane_title}')
+
+  [[ ${#matches[@]} -eq 0 ]] && EXIT_CODE=1 die "no live pane for identity '$agent'"
+  [[ ${#matches[@]} -gt 1 ]] && EXIT_CODE=1 die "ambiguous identity '$agent' — matches: ${matches[*]}"
+  printf '%s\n' "${matches[0]}"
+}
+
+# 3. pane_pid → claude PID (pane itself or a direct child process)
+find_claude_pid() {
+  local pane_pid="$1" pid comm
+  for pid in "$pane_pid" $(pgrep -P "$pane_pid" 2>/dev/null || true); do
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+    [[ "$comm" == "claude" ]] && { printf '%s\n' "$pid"; return 0; }
+  done
+  EXIT_CODE=2 die "no claude process under pane pid $pane_pid"
+}
+
+# 4a. FAST PATH — claude PID → transcript via any FD under ~/.claude/tasks/<uuid>/.
+# Returns empty string (not exit) when no such FD exists, so the caller can try
+# the fallback below. Returns the transcript path on hit.
+transcript_via_fd() {
+  local pid="$1" fd target uuid matches=()
+  for fd in /proc/"$pid"/fd/*; do
+    target=$(readlink "$fd" 2>/dev/null) || continue
+    if [[ "$target" =~ ^$TASKS_DIR/([0-9a-f-]+)(/.*)?$ ]]; then
+      uuid="${BASH_REMATCH[1]}"
+      shopt -s nullglob
+      matches=( "$PROJECTS_DIR"/*/"$uuid.jsonl" )
+      shopt -u nullglob
+      [[ ${#matches[@]} -eq 0 ]] && EXIT_CODE=4 die "transcript $uuid.jsonl not found (FD-derived uuid)"
+      [[ ${#matches[@]} -gt 1 ]] && EXIT_CODE=4 die "transcript $uuid.jsonl ambiguous (FD-derived): ${matches[*]}"
+      printf '%s\n' "${matches[0]}"
+      return 0
+    fi
+  done
+  return 0  # no FD found → caller falls through to cwd+T_start fallback
+}
+
+# Compute wall-clock process start time (epoch seconds) for a pid by combining
+# /proc/stat's 'btime' with /proc/<pid>/stat's starttime (field 22, in jiffies).
+proc_start_epoch() {
+  local pid="$1"
+  local btime clk_tck sj
+  btime=$(awk '/^btime /{print $2; exit}' /proc/stat)
+  clk_tck=$(getconf CLK_TCK)
+  sj=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null) || return 1
+  printf '%s\n' "$(( btime + sj / clk_tck ))"
+}
+
+# 4b. FALLBACK — claude PID → transcript by cwd + process-start correlation.
+#
+# For each jsonl in the cwd's project dir, read the timestamp of the MOST RECENT
+# bridge_status entry (T_entry) and pick the transcript whose T_entry satisfies
+# T_start <= T_entry <= T_start + TOLERANCE, picking the smallest such value.
+#
+# TOLERANCE (default 300s, AGENT_SESSION_URL_TOLERANCE_SEC env override) caps
+# how far after T_start a match can be. bridge_status is written when the
+# session becomes remote-controlled (start, resume, or explicit toggle). For
+# session-start / resume flows the entry lands within seconds; a stale
+# transcript for some other process will typically be hours off. The
+# tolerance filters out cross-session false positives at the cost of
+# false-negativing long-running sessions that only enabled /remote-control
+# later — which then exit 5 honestly ("no URL for this session").
+transcript_via_cwd() {
+  local pid="$1"
+  local cwd sanitized project_dir t_start
+  cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || return 1
+  sanitized="${cwd//\//-}"
+  project_dir="$PROJECTS_DIR/$sanitized"
+  [[ -d "$project_dir" ]] || return 1
+
+  t_start=$(proc_start_epoch "$pid") || return 1
+
+  # Invoke python3 once for per-file bridge_status extraction + selection.
+  PROJ_DIR="$project_dir" T_START="$t_start" TOL="${AGENT_SESSION_URL_TOLERANCE_SEC:-300}" \
+    python3 <<'PYEOF'
+import json, os, sys
+from pathlib import Path
+
+proj = Path(os.environ["PROJ_DIR"])
+t_start = int(os.environ["T_START"])
+tol = int(os.environ["TOL"])
+
+def parse_iso(ts: str) -> int:
+    from datetime import datetime
+    return int(datetime.strptime(ts.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S.%f%z").timestamp())
+
+best = None  # (t_entry, path)
+for f in proj.glob("*.jsonl"):
+    last_ts = None
+    try:
+        with f.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if '"subtype":"bridge_status"' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if entry.get("subtype") != "bridge_status":
+                        continue
+                    last_ts = entry.get("timestamp")
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        continue
+    if last_ts is None:
+        continue
+    try:
+        t_entry = parse_iso(last_ts)
+    except Exception:
+        continue
+    # Must be at or after T_start AND within tolerance.
+    if t_entry < t_start or t_entry - t_start > tol:
+        continue
+    if best is None or t_entry < best[0]:
+        best = (t_entry, f)
+
+if best is None:
+    sys.exit(2)  # caller maps to "no URL for this session" (exit 5)
+print(best[1])
+PYEOF
+}
+
+# Resolve transcript path: try FD first, fall back to cwd+T_start.
+# Distinguishes two fallback-failure modes:
+#   return 2 from transcript_via_cwd (via the python selector exit 2) →
+#       no bridge_status within tolerance → exit 5 (semantic: no URL)
+#   return 1 from transcript_via_cwd (bash, structural) →
+#       couldn't even try (no cwd, no project dir, etc.) → exit 3
+resolve_transcript() {
+  local pid="$1" tr rc
+  tr=$(transcript_via_fd "$pid") || return 1
+  if [[ -n "$tr" ]]; then
+    printf '%s\n' "$tr"
+    return 0
+  fi
+  rc=0
+  tr=$(transcript_via_cwd "$pid") || rc=$?
+  if [[ $rc -eq 0 && -n "$tr" ]]; then
+    printf '%s\n' "$tr"
+    return 0
+  fi
+  if [[ $rc -eq 2 ]]; then
+    EXIT_CODE=5 die "no bridge_status within ${AGENT_SESSION_URL_TOLERANCE_SEC:-300}s of claude pid $pid's start time (session may not have remote-control enabled)"
+  fi
+  EXIT_CODE=3 die "could not resolve claude pid $pid's session (no tasks FD; cwd-based lookup failed structurally)"
+}
+
+# --- arg parsing (position-agnostic --json, same shape as agent-blocked-poll) ---
+
+AGENT=""
+JSON=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help|help)
+      cat <<'EOF'
+Usage:
+  agent-session-url <agent-id>           Print the agent's Remote Control URL
+  agent-session-url <agent-id> --json    Structured metadata
+
+<agent-id>: bare (mgmt.arch) or fully-qualified (mgmt.arch@a10k.internal)
+
+Exit codes:
+  0  URL (or JSON object) emitted on stdout
+  1  no live pane for identity (or ambiguous)
+  2  pane is not running claude
+  3  claude process has no ~/.claude/tasks/ FD (session inactive)
+  4  transcript not found (or ambiguous) in ~/.claude/projects/*/
+  5  no bridge_status entry in transcript (session started without remote-control)
+EOF
+      exit 0 ;;
+    --json) JSON=1; shift ;;
+    -*) die "unknown flag: $1" ;;
+    *)
+      [[ -n "$AGENT" ]] && die "unexpected argument: '$1' (already have '$AGENT')"
+      AGENT="$1"; shift ;;
+  esac
+done
+[[ -z "$AGENT" ]] && die "usage: agent-session-url <agent-id> [--json]"
+
+# --- chain execution ---
+
+PANE=$(find_pane "$AGENT")
+read -r PANE_PID CMD < <(tmux display-message -t "$PANE" -p '#{pane_pid} #{pane_current_command}')
+[[ "$CMD" != "claude" ]] && EXIT_CODE=2 die "pane $PANE is not running claude (got: $CMD)"
+
+CLAUDE_PID=$(find_claude_pid "$PANE_PID")
+TRANSCRIPT=$(resolve_transcript "$CLAUDE_PID")
+SESSION_UUID=$(basename "$TRANSCRIPT" .jsonl)
+
+# 6. Most recent bridge_status entry wins (remote-control may have been toggled).
+# `|| true` so empty grep doesn't abort under set -e pipefail; we check below.
+BRIDGE=$(grep '"subtype":"bridge_status"' "$TRANSCRIPT" | tail -1) || true
+[[ -z "$BRIDGE" ]] && EXIT_CODE=5 die "no bridge_status entry in $TRANSCRIPT"
+
+# --- output ---
+
+if [[ $JSON -eq 1 ]]; then
+  BRIDGE="$BRIDGE" SESSION_UUID="$SESSION_UUID" AGENT="$AGENT" PANE="$PANE" TRANSCRIPT="$TRANSCRIPT" \
+    python3 <<'PYEOF'
+import json, os
+entry = json.loads(os.environ["BRIDGE"])
+print(json.dumps({
+    "url": entry["url"],
+    "session_id": os.environ["SESSION_UUID"],
+    "agent_id": os.environ["AGENT"],
+    "pane": os.environ["PANE"],
+    "transcript_path": os.environ["TRANSCRIPT"],
+    "claude_version": entry.get("version"),
+    "bridge_status_timestamp": entry.get("timestamp"),
+}))
+PYEOF
+else
+  BRIDGE="$BRIDGE" python3 -c 'import json, os; print(json.loads(os.environ["BRIDGE"])["url"])'
+fi
