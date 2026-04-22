@@ -27,6 +27,28 @@ DEX_GRPC="192.168.88.3:5557"
 DEX_ISSUER="https://id.a10k.co"
 PROTO="$HOME/.config/bin/dex.proto"
 
+# Help is answerable on a fresh machine — handle it before any validation
+# gate so a user figuring out the tool doesn't need the hosts file or
+# secrets file in place just to read the usage text.
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+  cat <<EOF
+Usage:
+  agent-register <identity>             Register a new identity (e.g. mgmt.arch)
+  agent-register --restore <identity>   Reset password for an existing identity
+  agent-register -h | --help            Show this message
+
+Registers <identity>@<domain> as an agent in the directory and stages
+credentials on this host. The domain comes from the 'localhost' self-entry
+in ~/.config/agent-message/hosts (override with --domain). When run inside
+a Claude Code session, the session is automatically renamed to match.
+
+Use --restore if you're re-provisioning on a new host or lost local credentials
+— it preserves history (tickets, comments, audit trail) by keeping the same
+user id.
+EOF
+  exit 0
+fi
+
 # Default domain comes from the agent-message hosts file's 'localhost'
 # self-entry — each host's operator picks its domain there. If that file
 # is missing or has no self-entry, fail fast (operator error; don't
@@ -66,23 +88,6 @@ source "$SECRETS_FILE"
 CLIENT_SECRET="${AGENT_CLI_SECRET:?AGENT_CLI_SECRET missing in $SECRETS_FILE}"
 
 # --- parse args ---
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
-  cat <<EOF
-Usage:
-  agent-register <identity>             Register a new identity (e.g. mgmt.arch)
-  agent-register --restore <identity>   Reset password for an existing identity
-  agent-register -h | --help            Show this message
-
-Registers <identity>@a10k.internal as an agent in the directory and stages
-credentials on this host. When run inside a Claude Code session, the session
-is automatically renamed to match.
-
-Use --restore if you're re-provisioning on a new host or lost local credentials
-— it preserves history (tickets, comments, audit trail) by keeping the same
-user id.
-EOF
-  exit 0
-fi
 
 RESTORE=0
 IDENTITY=""
