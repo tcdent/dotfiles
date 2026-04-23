@@ -2,13 +2,17 @@
 # agent-status: unified pane-state report for all registered agents.
 #
 # Scans tmux for panes running claude whose pane_title contains a
-# registered identity (@<domain>). Reports each agent's current state:
-# idle, working, blocked (approval/menu/survey/other), or exited.
+# registered identity (@<domain>). Reports each agent's current state
+# using ONLY proven, tested predicates from agent-restart and
+# agent-blocked-poll:
 #
-# "Blocked" means the input prompt is not available — the agent needs
-# interaction or is stuck on a dialog. Specific block types are reported
-# when the signature is recognized; unrecognized blocks report as
-# "blocked (unknown)".
+#   idle      — empty prompt (is_empty_prompt from agent-restart, heavily exercised)
+#   approval  — permission dialog (from agent-blocked-poll, fixtures 01-03)
+#   menu      — resume-from-summary dialog (from agent-restart v1.4, fleet-validated)
+#   blocked   — input prompt unavailable, none of the above matched
+#
+# Only panes running claude with a registered identity are reported.
+# Non-claude panes and unregistered agents are skipped.
 #
 # Usage:
 #   agent-status                        Text summary, all registered agents
@@ -27,9 +31,10 @@ identity_from_title() {
   printf '%s\n' "$1" | grep -oE '[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+' | head -1 || true
 }
 
-# --- Pane-state predicates (from agent-message + agent-restart + agent-blocked-poll) ---
+# --- Pane-state predicates ---
+# Only predicates with proven, tested matches from existing tools.
 
-# Capture pane content, strip trailing blanks. Shared by all predicates.
+# Capture pane content, strip trailing blanks.
 capture_stripped() {
   local pane="$1"
   local content
@@ -37,12 +42,14 @@ capture_stripped() {
   printf '%s\n' "$content" | sed -e :a -e '/^[[:space:]]*$/{ $d; N; ba; }'
 }
 
+# [PROVEN: agent-restart, exercised on every cycle across 20+ agents]
 # Empty prompt: live input line is ❯ + NBSP + (EOL or space).
 is_empty_prompt() {
   local content="$1"
   printf '%s\n' "$content" | tail -10 | grep -qP '^❯\x{00a0}($| )'
 }
 
+# [PROVEN: agent-blocked-poll, fixtures 01-03, live-validated on infra.lead + two.ui]
 # Approval dialog: "Do you want to proceed?" + menu selector.
 is_approval_prompt() {
   local content="$1"
@@ -67,7 +74,7 @@ extract_approval_section() {
       if (!q) exit 1
       i = q - 1
       while (i >= 1 && lines[i] ~ /^[[:space:]]*$/) i--
-      # Skip any 1-space warning lines (Bug: security-reasoning lines)
+      # Skip any 1-space warning lines (security-reasoning lines)
       while (i >= 1 && lines[i] ~ /^ [^ ]/ && lines[i] !~ /^ [A-Z][a-z]+ *(command|file|\()/) i--
       if (i >= 1 && lines[i] ~ /^   [^ ]/) {
         while (i >= 1 && lines[i] ~ /^   /) i--
@@ -81,33 +88,26 @@ extract_approval_section() {
   '
 }
 
+# [PROVEN: agent-restart v1.4, fleet-validated on mgmt.plane + vm.bench + vm.lead + manual Bug #5 resolution on 5 agents]
 # Resume-from-summary menu.
 is_resume_menu() {
   local content="$1"
   printf '%s\n' "$content" | tail -15 | grep -qF 'Resume from summary'
 }
 
-# Feedback survey.
-is_feedback_survey() {
-  local content="$1"
-  printf '%s\n' "$content" | tail -15 | grep -qF 'How is Claude doing this session?'
-}
-
 # --- State classifier ---
-# Returns: idle | working | approval:<section> | menu | survey | blocked | exited
+# Returns: idle | approval[:<section>] | menu | blocked
 
 classify_pane() {
   local pane="$1"
   local cmd
   cmd=$(tmux display-message -t "$pane" -p '#{pane_current_command}' 2>/dev/null || true)
 
-  if [[ "$cmd" != "claude" ]]; then
-    echo "exited"
-    return
-  fi
+  # Only classify panes actually running claude
+  [[ "$cmd" != "claude" ]] && return 1
 
   local content
-  content=$(capture_stripped "$pane") || { echo "exited"; return; }
+  content=$(capture_stripped "$pane") || return 1
 
   if is_empty_prompt "$content"; then
     echo "idle"
@@ -130,17 +130,8 @@ classify_pane() {
     return
   fi
 
-  if is_feedback_survey "$content"; then
-    echo "survey"
-    return
-  fi
-
-  # Claude is running but not at any recognized prompt/dialog — working or
-  # in an unrecognized blocking state. Both mean "input prompt unavailable".
-  # We report as "working" since that's the common case (mid-tool-use,
-  # thinking, composing). If it's actually stuck on an unrecognized dialog,
-  # the operator will see it's not making progress over time.
-  echo "working"
+  # Input prompt unavailable, no recognized state matched.
+  echo "blocked"
 }
 
 # --- Output ---
@@ -182,15 +173,14 @@ Usage:
   agent-status <identity>             Single agent
   agent-status <identity> --json      Single agent, json
 
-States:
+States (proven predicates only):
   idle           Empty prompt, ready for input
-  working        Mid-tool-use, thinking, or composing
   approval       At a permission dialog (detail: tool section header)
   menu           At the resume-from-summary menu
-  survey         At the feedback survey
-  exited         Pane exists but claude not running
+  blocked        Input prompt unavailable (unrecognized state)
 
-Exit 0 always (status is informational, not pass/fail).
+Only panes running claude with a registered identity are reported.
+Exit 0 always (status is informational).
 HELPEOF
       exit 0
       ;;
@@ -207,14 +197,13 @@ while IFS=$'\t' read -r addr cmd title; do
   identity=$(identity_from_title "$title")
   [[ -z "$identity" ]] && continue
 
-  # If targeting a specific agent, skip non-matches
   if [[ -n "$TARGET" ]]; then
     if [[ "$TARGET" != "$identity" && "$TARGET" != "${identity%@*}" ]]; then
       continue
     fi
   fi
 
-  state=$(classify_pane "$addr")
+  state=$(classify_pane "$addr") || continue
 
   if [[ $JSON -eq 1 ]]; then
     emit_json "$identity" "$addr" "$state"
