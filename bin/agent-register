@@ -79,9 +79,9 @@ DOMAIN=$(derive_domain_from_hosts)
 }
 
 # agent-cli OAuth client — provisioned once in Dex, shared by all agents for ROPC.
-# Secret loaded from a gitignored file since ~/.config is a public repo.
+# Secret loaded from ~/.env (single-source env file; house convention since 2026-04-23).
 CLIENT_ID="agent-cli"
-SECRETS_FILE="$HOME/.config/agent-tracker/secrets.env"
+SECRETS_FILE="$HOME/.env"
 [[ -r "$SECRETS_FILE" ]] || { echo "error: $SECRETS_FILE not found (owner-readable expected)" >&2; exit 3; }
 # shellcheck source=/dev/null
 source "$SECRETS_FILE"

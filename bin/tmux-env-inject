@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# tmux-env-inject: propagate a named env var from ~/.env into tmux's
+# global env and update-environment list. Idempotent — the append to
+# update-environment is guarded against duplicates so repeated
+# `tmux source-file ~/.tmux.conf` cycles don't build up duplicate
+# entries.
+#
+# Usage: tmux-env-inject <VAR_NAME>
+#
+# Typical invocation from ~/.config/tmux/tmux.conf:
+#   run-shell 'tmux-env-inject TWO_HOOK_PSK'
+#
+# Source of truth is ~/.env (per 2026-04-23 convention). Values stay in
+# that file (gitignored by convention — the file itself lives outside any
+# tracked repo); this script does not create, edit, or log the secret.
+
+set -euo pipefail
+
+VAR="${1:?usage: tmux-env-inject <VAR_NAME>}"
+ENV_FILE="${HOME}/.env"
+
+[[ -r "$ENV_FILE" ]] || { echo "tmux-env-inject: $ENV_FILE not readable" >&2; exit 1; }
+
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+[[ -n "${!VAR:-}" ]] || { echo "tmux-env-inject: $VAR not set in $ENV_FILE" >&2; exit 1; }
+
+tmux set-environment -g "$VAR" "${!VAR}"
+
+# Guard with word-boundary regex so e.g. TWO_HOOK_PSK doesn't false-match
+# against TWO_HOOK_PSK_OLD.
+if ! tmux show-option -g update-environment 2>/dev/null | grep -qE "(^| )${VAR}( |\$)"; then
+  tmux set-option -ag update-environment "$VAR"
+fi

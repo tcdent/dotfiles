@@ -53,11 +53,11 @@ PLANE_API_URL = "https://api.tracker.a10k.co"
 DEFAULT_WORKSPACE_SLUG = "a10k"
 
 # Workspace-admin PAT used only to grant project memberships during auth init.
-# Never loaded into agent context — agent-tracker reads it on demand from a
-# gitignored secrets file (~/.config is a public repo). Issued to the dedicated
-# admin.plane@a10k.internal service account (workspace role 20).
+# Never loaded into agent context — agent-tracker reads it on demand from
+# ~/.env (single-source env file; house convention since 2026-04-23). Issued
+# to the dedicated admin.plane@a10k.internal service account (workspace role 20).
 def _load_admin_pat() -> str | None:
-    path = Path.home() / ".config" / "agent-tracker" / "secrets.env"
+    path = Path.home() / ".env"
     if not path.is_file():
         return None
     for line in path.read_text().splitlines():
