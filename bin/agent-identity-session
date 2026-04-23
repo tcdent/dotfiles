@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# agent-identity-session: resolve a session UUID to its agent identity.
+#
+# Reverse of agent-session-url (MGMT-24). Shares the /proc-based resolver
+# mechanics and the cascade-with-tolerance pattern. Helpers are copied with
+# provenance comments rather than factored out — a third tool needing the
+# same primitives would justify a shared library.
+#
+# Chain:
+#   1. session_uuid → claude_pid
+#        FAST: scan all live claude processes for an FD under
+#              ~/.claude/tasks/<uuid>/
+#        FALLBACK: glob transcript by UUID → derive project dir → scan
+#              claude processes whose cwd sanitizes to that project dir →
+#              pick the one whose T_start is within tolerance of the
+#              transcript's most-recent bridge_status timestamp.
+#   2. claude_pid → pane
+#        Walk tmux list-panes; match pane_pid == claude_pid OR pane_pid ==
+#        claude's parent (from /proc/<claude_pid>/status PPid).
+#   3. pane → identity
+#        pane_title regex — same pattern agent-session-url uses.
+#
+# Usage:
+#   agent-identity-session <session-uuid>           Print identity
+#   agent-identity-session <session-uuid> --json    Structured metadata
+#
+# Linux-only (uses /proc). macOS port deferred.
+
+set -euo pipefail
+
+PROJECTS_DIR="$HOME/.claude/projects"
+TASKS_DIR="$HOME/.claude/tasks"
+
+die() { echo "error: $*" >&2; exit "${EXIT_CODE:-4}"; }
+
+# --- helpers (copied from agent-session-url where reused) ---
+
+# [provenance: agent-session-url / proc_start_epoch]
+# Wall-clock process start time (epoch seconds) from /proc/stat's 'btime' +
+# /proc/<pid>/stat field 22 (starttime in jiffies).
+proc_start_epoch() {
+  local pid="$1"
+  local btime clk_tck sj
+  btime=$(awk '/^btime /{print $2; exit}' /proc/stat)
+  clk_tck=$(getconf CLK_TCK)
+  sj=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null) || return 1
+  printf '%s\n' "$(( btime + sj / clk_tck ))"
+}
+
+# --- new helpers (reverse direction) ---
+
+# 1a. FAST PATH — enumerate claude PIDs holding an FD under tasks/<uuid>/.
+# Emits matching PIDs on stdout, one per line. Empty output = no match;
+# multiple lines = split-brain (caller decides).
+claude_pids_via_fd() {
+  local uuid="$1" pid fd target
+  local want_prefix="$TASKS_DIR/$uuid"
+  for pid in $(pgrep -x -u "$(id -u)" claude 2>/dev/null || true); do
+    for fd in /proc/"$pid"/fd/*; do
+      target=$(readlink "$fd" 2>/dev/null) || continue
+      # Match both the bare tasks dir and any file within it
+      # (e.g. .lock, numbered json).
+      if [[ "$target" == "$want_prefix" || "$target" == "$want_prefix/"* ]]; then
+        printf '%s\n' "$pid"
+        break  # break out of fd loop; this claude matches
+      fi
+    done
+  done
+}
+
+# 1b. FALLBACK — use the transcript's cwd and most-recent bridge_status
+# timestamp to find a claude process in the same cwd whose T_start falls
+# within TOLERANCE before that timestamp.
+#
+# Returns the matching claude PID on stdout.
+# Return codes:
+#   0  found exactly one match
+#   1  structural (no transcript, no bridge_status)
+#   2  no match within tolerance (no live claude process owns this session)
+#   5  multiple matches within tolerance (split-brain)
+claude_pid_via_cwd_tstart() {
+  local uuid="$1"
+  local matches=()
+  shopt -s nullglob
+  matches=( "$PROJECTS_DIR"/*/"$uuid.jsonl" )
+  shopt -u nullglob
+  [[ ${#matches[@]} -eq 0 ]] && return 1
+  [[ ${#matches[@]} -gt 1 ]] && return 1
+  local transcript="${matches[0]}"
+  local session_proj_dir
+  session_proj_dir=$(dirname "$transcript")
+
+  # Get T_bridge: most recent bridge_status timestamp, as epoch seconds.
+  local t_bridge
+  t_bridge=$(TRANSCRIPT="$transcript" python3 <<'PYEOF'
+import json, os, sys
+from datetime import datetime
+last_ts = None
+with open(os.environ["TRANSCRIPT"]) as f:
+    for line in f:
+        if '"subtype":"bridge_status"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+            if entry.get("subtype") == "bridge_status":
+                last_ts = entry.get("timestamp")
+        except json.JSONDecodeError:
+            continue
+if last_ts is None:
+    sys.exit(2)
+t = datetime.strptime(last_ts.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S.%f%z")
+print(int(t.timestamp()))
+PYEOF
+  ) || return 1
+
+  local tol="${AGENT_SESSION_URL_TOLERANCE_SEC:-300}"
+  # Mirror of agent-session-url's rule, applied in reverse: for each claude
+  # process in the same cwd, the transcript whose most-recent bridge_status
+  # is the SMALLEST T_entry >= T_start is its transcript. Reversing: given a
+  # transcript's T_bridge, pick the pid whose T_start is the largest value
+  # satisfying T_start <= T_bridge (i.e. smallest non-negative delta).
+  # That pairing is the inverse of the forward disambiguator, so reverse
+  # lookup agrees with forward lookup on every shared-cwd cohort.
+  local best_pid="" best_delta=0 tied=0
+  local pid pcwd psan t_start delta
+  for pid in $(pgrep -x -u "$(id -u)" claude 2>/dev/null || true); do
+    pcwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+    psan="${pcwd//\//-}"
+    [[ "$PROJECTS_DIR/$psan" != "$session_proj_dir" ]] && continue
+    t_start=$(proc_start_epoch "$pid") || continue
+    delta=$(( t_bridge - t_start ))
+    (( delta < 0 || delta > tol )) && continue
+    if [[ -z "$best_pid" ]]; then
+      best_pid="$pid"; best_delta="$delta"; tied=0
+    elif (( delta < best_delta )); then
+      best_pid="$pid"; best_delta="$delta"; tied=0
+    elif (( delta == best_delta )); then
+      tied=1
+    fi
+  done
+
+  [[ -z "$best_pid" ]] && return 2
+  (( tied )) && return 5
+  printf '%s\n' "$best_pid"
+}
+
+# Resolve session_uuid → claude_pid via the cascade.
+resolve_claude_pid() {
+  local uuid="$1"
+  local pids=()
+  mapfile -t pids < <(claude_pids_via_fd "$uuid")
+  if [[ ${#pids[@]} -eq 1 ]]; then
+    printf '%s\n' "${pids[0]}"
+    return 0
+  fi
+  if [[ ${#pids[@]} -gt 1 ]]; then
+    EXIT_CODE=5 die "split-brain: session $uuid owned by multiple claude processes: ${pids[*]}"
+  fi
+
+  # FALLBACK
+  local rc=0 pid
+  pid=$(claude_pid_via_cwd_tstart "$uuid") || rc=$?
+  if [[ $rc -eq 0 && -n "$pid" ]]; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+  case "$rc" in
+    5)  EXIT_CODE=5 die "split-brain: session $uuid's cwd has multiple claude processes matching within tolerance" ;;
+    2)  EXIT_CODE=1 die "no live claude process for session $uuid (no FD match and no T_start match within ${AGENT_SESSION_URL_TOLERANCE_SEC:-300}s)" ;;
+    1)  EXIT_CODE=1 die "no live claude process for session $uuid (no transcript or bridge_status)" ;;
+    *)  EXIT_CODE=4 die "unexpected fallback exit $rc while resolving session $uuid" ;;
+  esac
+}
+
+# 2. claude_pid → pane. Pane's pane_pid is usually the pane's shell (bash),
+# and claude runs as a direct child. Match either case.
+find_pane_for_pid() {
+  local cpid="$1"
+  local ppid
+  ppid=$(awk '/^PPid:/{print $2}' "/proc/$cpid/status" 2>/dev/null) || ppid=""
+  local addr pane_pid
+  while IFS=$'\t' read -r addr pane_pid; do
+    if [[ "$pane_pid" == "$cpid" || ( -n "$ppid" && "$pane_pid" == "$ppid" ) ]]; then
+      printf '%s\n' "$addr"
+      return 0
+    fi
+  done < <(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}	#{pane_pid}')
+  EXIT_CODE=2 die "claude pid $cpid (ppid $ppid) has no matching tmux pane"
+}
+
+# --- arg parsing (position-agnostic --json) ---
+
+UUID=""
+JSON=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help|help)
+      cat <<'EOF'
+Usage:
+  agent-identity-session <session-uuid>           Print the agent's identity
+  agent-identity-session <session-uuid> --json    Structured metadata
+
+<session-uuid>: Claude session UUID (lowercase hex-dashes form).
+
+Exit codes:
+  0  identity emitted on stdout
+  1  no live claude process for this session UUID
+  2  claude process found but no matching tmux pane
+  3  pane found but no identity in pane_title (bare, not /renamed)
+  4  structural failure
+  5  session UUID resolves to multiple claude processes (split-brain)
+EOF
+      exit 0 ;;
+    --json) JSON=1; shift ;;
+    -*) die "unknown flag: $1" ;;
+    *)
+      [[ -n "$UUID" ]] && die "unexpected argument: '$1' (already have '$UUID')"
+      UUID="$1"; shift ;;
+  esac
+done
+[[ -z "$UUID" ]] && die "usage: agent-identity-session <session-uuid> [--json]"
+
+# Light format sanity check — not exhaustive, but catches obvious typos
+# (e.g. passing an identity or URL by mistake).
+[[ "$UUID" =~ ^[0-9a-f-]+$ ]] || die "'$UUID' does not look like a session UUID"
+
+# --- chain execution ---
+
+CLAUDE_PID=$(resolve_claude_pid "$UUID")
+PANE=$(find_pane_for_pid "$CLAUDE_PID")
+TITLE=$(tmux display-message -t "$PANE" -p '#{pane_title}')
+IDENTITY=$(grep -oE '[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+' <<< "$TITLE" | head -1 || true)
+[[ -z "$IDENTITY" ]] && EXIT_CODE=3 die "pane $PANE has no identity in pane_title (bare session, not /renamed?)"
+
+# --- output ---
+
+if [[ $JSON -eq 1 ]]; then
+  CWD=$(readlink "/proc/$CLAUDE_PID/cwd" 2>/dev/null || true)
+  shopt -s nullglob
+  MATCHES=( "$PROJECTS_DIR"/*/"$UUID.jsonl" )
+  shopt -u nullglob
+  TRANSCRIPT="${MATCHES[0]:-}"
+  IDENTITY="$IDENTITY" UUID="$UUID" PANE="$PANE" CLAUDE_PID="$CLAUDE_PID" \
+    CWD="$CWD" TRANSCRIPT="$TRANSCRIPT" \
+    python3 <<'PYEOF'
+import json, os
+print(json.dumps({
+    "identity": os.environ["IDENTITY"],
+    "session_id": os.environ["UUID"],
+    "pane": os.environ["PANE"],
+    "claude_pid": int(os.environ["CLAUDE_PID"]),
+    "cwd": os.environ["CWD"],
+    "transcript_path": os.environ["TRANSCRIPT"],
+}))
+PYEOF
+else
+  printf '%s\n' "$IDENTITY"
+fi
