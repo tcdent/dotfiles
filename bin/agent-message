@@ -51,8 +51,9 @@ load_hosts() {
 
     read -r user_host rest <<< "$line"
     [[ -z "$user_host" || -z "$rest" ]] && continue
-    # Accept literal 'localhost' for the self-entry, or user@host[:port] for remote.
-    [[ "$user_host" == "localhost" || "$user_host" == *"@"* ]] || continue
+    # Accept literal 'localhost' for the self-entry, user@host[:port] for SSH
+    # remote, or http://... for HTTP relay (MGMT-37 hub-and-spoke transport).
+    [[ "$user_host" == "localhost" || "$user_host" == *"@"* || "$user_host" == http://* ]] || continue
 
     for d in $rest; do
       HOST_FOR_DOMAIN["$d"]="$user_host"
@@ -119,7 +120,7 @@ reverse_identity() {
   addr=$(tmux display-message -p -t "$target" "#{session_name}:#{window_index}.#{pane_index}" 2>/dev/null || true)
 
   case "$addr" in
-    two:2.1) echo "two@a10k.co"; return 0 ;;
+    # two:2.1 reverse alias removed — Two routes via HTTP relay now
   esac
 
   local title
@@ -164,56 +165,13 @@ escape_message() {
   printf '%s' "$msg"
 }
 
-# Check whether a target pane is ready to receive a message.
-#
-# For Claude panes, we look for the text entry prompt (❯ followed by an
-# empty/whitespace-only line). This is the only state where the agent is
-# ready to accept input. Any other state — approval dialogs, mid-tool-use,
-# user composing — means the agent is busy.
-#
-# Non-Claude panes are always considered ready.
-#
-# TODO: Consider distinguishing "user is composing" from "agent is busy"
-# TODO: Test behavior when agent is mid-tool-use with auto-approve
-check_target_ready() {
-  local target="$1"
-
-  local target_cmd
-  target_cmd=$(tmux display-message -t "$target" -p "#{pane_current_command}")
-
-  # Only check Claude panes — non-Claude panes are always ready
-  [[ "$target_cmd" != "claude" ]] && return 0
-
-  # Capture the visible pane, strip trailing blank lines, check the last 10
-  # lines for the prompt canary.
-  #
-  # Byte signatures:
-  #   Empty prompt (ready):   e2 9d af  c2 a0  [20|0a]  → ❯ + NBSP + (space or EOL)
-  #   User composing (busy):  e2 9d af  c2 a0  [text]   → ❯ + NBSP + typed chars
-  #   Sent message (history): e2 9d af  20     [text]   → ❯ + regular space + text
-  #
-  # Pattern: ^❯\x{00a0}($| )
-  #   - Matches only the live input prompt (NBSP distinguishes from history)
-  #   - EOL or space after NBSP = empty prompt, ready to receive
-  #   - Text after NBSP = user is composing, block delivery
-  #   - Convention: a leading space in user input is treated as "empty" (allows
-  #     agents to deliver even when user has started but wants to yield)
-  local pane_content
-  pane_content=$(tmux capture-pane -t "$target" -p | sed -e :a -e '/^[[:space:]]*$/{ $d; N; ba; }')
-
-  if echo "$pane_content" | tail -10 | grep -qP '^❯\x{00a0}($| )'; then
-    return 0
-  fi
-
-  die "target is not ready to receive - no data was sent - backoff and try again shortly"
-}
 
 # Resolve a target address to a concrete tmux address, or to a REMOTE sentinel
 # indicating the identity lives on another host.
 #
 # Accepts:
 #   session:window.pane            — tmux address, pass-through (always local)
-#   two@a10k.co                    — hardcoded within-host alias → two:2.1
+#   <id>@<domain>                  — routed via hosts file (localhost, SSH, or HTTP relay)
 #   <id>@<domain>                  — the domain MUST be in the hosts file.
 #                                    If its entry is 'localhost', looks up
 #                                    the pane on our tmux server. If it's a
@@ -229,12 +187,10 @@ resolve_target() {
     return 0
   fi
 
-  # Hardcoded aliases — hardcoded tmux-pane shortcuts that aren't domain-routed.
-  # Checked before the hosts-file lookup so alias semantics stay stable regardless
-  # of what the file says about their notional domain.
-  case "$target" in
-    two@a10k.co) echo "two:2.1"; return 0 ;;
-  esac
+  # NOTE: two@a10k.co was previously a hardcoded alias → two:2.1 (local
+  # tmux delivery). Removed per MGMT-37 — Two now receives ALL messages
+  # through the HTTP relay endpoint. Route a10k.co domain via the hosts
+  # file entry: http://localhost:8787  a10k.co
 
   # Identity by domain. The hosts file is the source of truth for all
   # reachable domains, including this host (via the 'localhost' entry).
@@ -252,11 +208,16 @@ resolve_target() {
       return 0
     fi
 
+    if [[ "$user_host" == http://* ]]; then
+      echo "RELAY:$user_host"
+      return 0
+    fi
+
     echo "REMOTE:$user_host"
     return 0
   fi
 
-  die "unrecognized target format: '$target' (expected session:window.pane, <id>@<domain>, or two@a10k.co)"
+  die "unrecognized target format: '$target' (expected session:window.pane or <id>@<domain>)"
 }
 
 # --- Commands ---
@@ -301,13 +262,13 @@ cmd_dir() {
   [[ -z "$pane_list" ]] && die "no panes found"
 
   while IFS=$'\t' read -r addr cmd title; do
-    local marker=""
-    [[ "$addr" == "$self" ]] && marker=" (you)"
-
-    # Prefer identity when the pane is tagged with one; fall back to tmux address.
+    # Only show registered agents (identity in pane_title).
     local display_addr
     display_addr=$(identity_from_title "$title")
-    [[ -z "$display_addr" ]] && display_addr="$addr"
+    [[ -z "$display_addr" ]] && continue
+
+    local marker=""
+    [[ "$addr" == "$self" ]] && marker=" (you)"
 
     printf "  %-36s %s%s\n" "$display_addr" "$cmd" "$marker"
   done <<< "$pane_list"
@@ -372,12 +333,15 @@ cmd_dir_network() {
   # Already emitted the localhost self-entry above; skip it in the remote
   # loop. SEEN also deduplicates remote entries that route several domains
   # to the same user@host.
+  # Fan out to SSH remotes only. http:// relay entries are hub-and-spoke
+  # (MGMT-37) — no directory visibility from the relay endpoint.
   declare -A SEEN=()
   SEEN[localhost]=1
   local uh
   for uh in "${HOST_FOR_DOMAIN[@]}"; do
     [[ -n "${SEEN[$uh]:-}" ]] && continue
     SEEN[$uh]=1
+    [[ "$uh" == http://* ]] && continue
     dump_remote_dir "$uh"
   done
 }
@@ -386,11 +350,19 @@ cmd_send() {
   # --raw: the message already carries a [from->to] envelope built by the
   # origin host, so don't re-envelope and don't consult local identity. Used
   # internally for the SSH hop in cross-host delivery; not a user-facing flag.
+  #
+  # --from <identity>: explicitly set sender identity in the envelope. Used
+  # by processes that aren't claude (e.g. twod) whose pane_title doesn't
+  # carry a registered identity. Overrides get_self_identity.
   local raw=0
-  if [[ "${1:-}" == "--raw" ]]; then
-    raw=1
-    shift
-  fi
+  local from_override=""
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --raw) raw=1; shift ;;
+      --from) from_override="${2:?--from requires an identity}"; shift 2 ;;
+      *) break ;;
+    esac
+  done
 
   local target="${1:-}"
   local message="${2:-}"
@@ -423,7 +395,7 @@ cmd_send() {
     fi
 
     local self
-    self=$(get_self_identity)
+    self="${from_override:-$(get_self_identity)}"
     local envelope="[$self->$target_display] $message"
 
     # Build the remote command with printf %q so the envelope survives SSH's
@@ -450,6 +422,49 @@ cmd_send() {
     return 0
   fi
 
+  # HTTP relay branch (MGMT-37): POST the envelope to a twod relay endpoint.
+  # Fire-and-forget; 202 = accepted. PSK auth via TWO_HOOK_PSK env var.
+  if [[ "$target" == RELAY:* ]]; then
+    local relay_url="${target#RELAY:}"
+
+    local self="" envelope
+    if [[ $raw -eq 1 ]]; then
+      envelope="$message"
+      # Extract sender from envelope for the 'from' field — best-effort parse
+      # of the "[sender->recipient] ..." format via bash parameter expansion.
+      local tmp="${envelope#\[}"
+      self="${tmp%%->*}"
+    else
+      self="${from_override:-$(get_self_identity)}"
+      envelope="[$self->$target_display] $message"
+    fi
+
+    local body
+    body=$(SELF="$self" TARGET="$target_display" ENVELOPE="$envelope" python3 -c '
+import json, os
+print(json.dumps({"from": os.environ["SELF"], "to": os.environ["TARGET"], "body": os.environ["ENVELOPE"]}))
+')
+
+    local rc=0
+    local relay_out
+    relay_out=$(curl -s -X POST \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer ${TWO_HOOK_PSK:-}" \
+      --max-time 10 \
+      -d "$body" \
+      "${relay_url}/internal/agents/messages" 2>&1) || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+      die "relay delivery failed (curl exit $rc): $relay_out"
+    fi
+
+    # Check for HTTP-level errors in the response body
+    if printf '%s' "$relay_out" | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get("status")=="accepted" else 1)' 2>/dev/null; then
+      return 0
+    fi
+    die "relay rejected message: $relay_out"
+  fi
+
   # Local delivery
   if ! tmux has-session -t "${target%%:*}" 2>/dev/null; then
     die "session '${target%%:*}' not found"
@@ -459,7 +474,22 @@ cmd_send() {
     die "pane '$target' not found"
   fi
 
-  check_target_ready "$target"
+  # Readiness check via agent-status. Resolve identity from target_display
+  # (if already an identity) or from the pane's title.
+  local _lookup="$target_display"
+  if [[ "$_lookup" != *"@"* ]]; then
+    local _title
+    _title=$(tmux display-message -t "$target" -p "#{pane_title}" 2>/dev/null || true)
+    _lookup=$(identity_from_title "$_title")
+  fi
+
+  if [[ -n "$_lookup" ]]; then
+    local _status
+    _status=$(agent-status "$_lookup" 2>/dev/null | awk '{print $NF}') || true
+    if [[ -n "$_status" && "$_status" != available:* ]]; then
+      die "target is not ready to receive - no data was sent - backoff and try again shortly"
+    fi
+  fi
 
   # Build the payload: --raw passes through, normal path prepends a
   # [self->target] envelope.
@@ -468,7 +498,7 @@ cmd_send() {
     payload="$message"
   else
     local self
-    self=$(get_self_identity)
+    self="${from_override:-$(get_self_identity)}"
     payload="[$self->$target_display] $message"
   fi
 
@@ -506,7 +536,7 @@ Scopes:
 Address formats accepted by send:
   <identity>@a10k.internal                 agent identity (preferred)
   session:window.pane                      tmux address (e.g. mgmt:2.7)
-  two@a10k.co                              cross-org alias
+  two@a10k.co                              routed via hosts file (HTTP relay or local)
 
 Examples:
   agent-message send mgmt.design@a10k.internal "can you review ticket ABC-42?"

@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
-# agent-status: unified pane-state report for all registered agents.
+# agent-status: input-availability report for registered agents.
 #
-# Scans tmux for panes running claude whose pane_title contains a
-# registered identity (@<domain>). Reports each agent's current state
-# using ONLY proven, tested predicates from agent-restart and
-# agent-blocked-poll:
+# Reports whether each agent's input prompt is available (can receive
+# messages) or unavailable (blocked on a dialog or other state).
 #
-#   idle      — empty prompt (is_empty_prompt from agent-restart, heavily exercised)
-#   approval  — permission dialog (from agent-blocked-poll, fixtures 01-03)
-#   menu      — resume-from-summary dialog (from agent-restart v1.4, fleet-validated)
-#   blocked   — input prompt unavailable, none of the above matched
+# Response format: <available|unavailable>:<reason>
+#
+#   available:unknown               Input prompt visible; background state unknown
+#   unavailable:requires_approval   Local permission dialog ("Do you want to proceed?")
+#   unavailable:survey              End-of-session feedback survey
+#   unavailable:unknown             Input not available; unrecognized state
 #
 # Only panes running claude with a registered identity are reported.
-# Non-claude panes and unregistered agents are skipped.
 #
 # Usage:
-#   agent-status                        Text summary, all registered agents
+#   agent-status                        All registered agents, text
 #   agent-status --json                 One ndjson record per agent
 #   agent-status <identity>             Single agent lookup
 #   agent-status <identity> --json      Single agent, json
@@ -31,10 +30,8 @@ identity_from_title() {
   printf '%s\n' "$1" | grep -oE '[a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+' | head -1 || true
 }
 
-# --- Pane-state predicates ---
-# Only predicates with proven, tested matches from existing tools.
+# --- Pane content ---
 
-# Capture pane content, strip trailing blanks.
 capture_stripped() {
   local pane="$1"
   local content
@@ -42,15 +39,22 @@ capture_stripped() {
   printf '%s\n' "$content" | sed -e :a -e '/^[[:space:]]*$/{ $d; N; ba; }'
 }
 
-# [PROVEN: agent-restart, exercised on every cycle across 20+ agents]
-# Empty prompt: live input line is ❯ + NBSP + (EOL or space).
-is_empty_prompt() {
+# --- Input-availability check ---
+# [PROVEN: agent-restart + agent-message, exercised across 20+ agents]
+# The ❯ + NBSP (U+00A0) pattern on the input line means the prompt is
+# accepting input. Remote hooks don't block this — the prompt is visible
+# even during http-hook waits, so "available" means "can receive messages."
+
+is_input_available() {
   local content="$1"
   printf '%s\n' "$content" | tail -10 | grep -qP '^❯\x{00a0}($| )'
 }
 
-# [PROVEN: agent-blocked-poll, fixtures 01-03, live-validated on infra.lead + two.ui]
-# Approval dialog: "Do you want to proceed?" + menu selector.
+# --- Unavailable-state detectors ---
+
+# [PROVEN: agent-blocked-poll, fixtures 01-03, live-validated]
+# Local permission dialog: "Do you want to proceed?" + numbered menu selector.
+# Only fires for non-hooked tools or when triage returns "ask".
 is_approval_prompt() {
   local content="$1"
   local tail30
@@ -62,99 +66,62 @@ is_approval_prompt() {
   return 1
 }
 
-# Extract approval section header (e.g. "Bash command", "Write(path)")
-extract_approval_section() {
+# [DOCUMENTED: agent-blocked-poll fixture 04, observed on two.lead]
+# End-of-session feedback survey. Blocks input until answered or dismissed.
+is_feedback_survey() {
   local content="$1"
-  printf '%s\n' "$content" | tail -30 | awk '
-    { lines[NR] = $0 }
-    END {
-      q = 0
-      for (i = NR; i >= 1; i--)
-        if (lines[i] ~ / Do you want to proceed\?/) { q = i; break }
-      if (!q) exit 1
-      i = q - 1
-      while (i >= 1 && lines[i] ~ /^[[:space:]]*$/) i--
-      # Skip any 1-space warning lines (security-reasoning lines)
-      while (i >= 1 && lines[i] ~ /^ [^ ]/ && lines[i] !~ /^ [A-Z][a-z]+ *(command|file|\()/) i--
-      if (i >= 1 && lines[i] ~ /^   [^ ]/) {
-        while (i >= 1 && lines[i] ~ /^   /) i--
-        while (i >= 1 && lines[i] ~ /^[[:space:]]*$/) i--
-      }
-      if (i >= 1 && lines[i] ~ /^ [^ ]/) {
-        s = lines[i]; sub(/^ /, "", s); sub(/[[:space:]]+$/, "", s)
-        print s
-      }
-    }
-  '
+  printf '%s\n' "$content" | tail -15 | grep -qF 'How is Claude doing this session?'
 }
 
-# [PROVEN: agent-restart v1.4, fleet-validated on mgmt.plane + vm.bench + vm.lead + manual Bug #5 resolution on 5 agents]
-# Resume-from-summary menu.
-is_resume_menu() {
-  local content="$1"
-  printf '%s\n' "$content" | tail -15 | grep -qF 'Resume from summary'
-}
-
-# --- State classifier ---
-# Returns: idle | approval[:<section>] | menu | blocked
+# --- Classifier ---
 
 classify_pane() {
   local pane="$1"
   local cmd
   cmd=$(tmux display-message -t "$pane" -p '#{pane_current_command}' 2>/dev/null || true)
-
-  # Only classify panes actually running claude
   [[ "$cmd" != "claude" ]] && return 1
 
   local content
   content=$(capture_stripped "$pane") || return 1
 
-  if is_empty_prompt "$content"; then
-    echo "idle"
+  if is_input_available "$content"; then
+    echo "available:unknown"
     return
   fi
 
   if is_approval_prompt "$content"; then
-    local section
-    section=$(extract_approval_section "$content" 2>/dev/null || true)
-    if [[ -n "$section" ]]; then
-      echo "approval:$section"
-    else
-      echo "approval"
-    fi
+    echo "unavailable:requires_approval"
     return
   fi
 
-  if is_resume_menu "$content"; then
-    echo "menu"
+  if is_feedback_survey "$content"; then
+    echo "unavailable:survey"
     return
   fi
 
-  # Input prompt unavailable, no recognized state matched.
-  echo "blocked"
+  echo "unavailable:unknown"
 }
 
 # --- Output ---
 
 emit_text() {
-  local identity="$1" pane="$2" state="$3"
-  printf '  %-40s %-12s %s\n' "$identity" "$pane" "$state"
+  local identity="$1" pane="$2" status="$3"
+  printf '  %-40s %-12s %s\n' "$identity" "$pane" "$status"
 }
 
 emit_json() {
-  local identity="$1" pane="$2" state="$3"
-  local state_base="${state%%:*}"
-  local detail=""
-  [[ "$state" == *:* ]] && detail="${state#*:}"
-
-  IDENTITY="$identity" PANE="$pane" STATE_BASE="$state_base" DETAIL="$detail" \
+  local identity="$1" pane="$2" status="$3"
+  local input="${status%%:*}"
+  local reason="${status#*:}"
+  IDENTITY="$identity" PANE="$pane" INPUT="$input" REASON="$reason" \
     python3 -c '
 import json, os
-d = {"identity": os.environ["IDENTITY"], "pane": os.environ["PANE"], "state": os.environ["STATE_BASE"]}
-detail = os.environ["DETAIL"]
-if detail:
-    d["detail"] = detail
-print(json.dumps(d))
+print(json.dumps({
+    "identity": os.environ["IDENTITY"],
+    "pane": os.environ["PANE"],
+    "input": os.environ["INPUT"],
+    "reason": os.environ["REASON"],
+}))
 '
 }
 
@@ -173,13 +140,12 @@ Usage:
   agent-status <identity>             Single agent
   agent-status <identity> --json      Single agent, json
 
-States (proven predicates only):
-  idle           Empty prompt, ready for input
-  approval       At a permission dialog (detail: tool section header)
-  menu           At the resume-from-summary menu
-  blocked        Input prompt unavailable (unrecognized state)
+Responses:
+  available:unknown               Input prompt visible
+  unavailable:requires_approval   Local permission dialog blocking input
+  unavailable:survey              Feedback survey blocking input
+  unavailable:unknown             Input not available, unrecognized state
 
-Only panes running claude with a registered identity are reported.
 Exit 0 always (status is informational).
 HELPEOF
       exit 0
@@ -190,7 +156,6 @@ HELPEOF
   shift
 done
 
-# Iterate registered agents (claude panes with identity in pane_title)
 ANY=0
 while IFS=$'\t' read -r addr cmd title; do
   [[ "$cmd" != "claude" ]] && continue
@@ -203,12 +168,12 @@ while IFS=$'\t' read -r addr cmd title; do
     fi
   fi
 
-  state=$(classify_pane "$addr") || continue
+  status=$(classify_pane "$addr") || continue
 
   if [[ $JSON -eq 1 ]]; then
-    emit_json "$identity" "$addr" "$state"
+    emit_json "$identity" "$addr" "$status"
   else
-    emit_text "$identity" "$addr" "$state"
+    emit_text "$identity" "$addr" "$status"
   fi
   ANY=1
 done < <(tmux list-panes -a -F "#{session_name}:#{window_index}.#{pane_index}	#{pane_current_command}	#{pane_title}")
