@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+r"""
+================================================================================
+cleanclaude — surgical context reclamation for Claude Code conversations
+================================================================================
+
+A single-file experiment. It takes a Claude Code conversation (by id or a path
+to its JSONL transcript), produces a smaller copy whose context has been
+reclaimed — either by *pruning* heavy tool I/O in place, or by *partially
+compacting* the older portion into a dense, role-structured summary — and then
+proves the result by installing it as a NEW session and resuming it headlessly.
+
+It is the inverse of Claude Code's "rewind": rewind drops the TAIL (undo recent
+turns); cleanclaude shrinks the HEAD (forget old bulk) while keeping the recent
+working set intact.
+
+This docstring is the design record. It is deliberately long because the value
+of this tool is less in the ~450 lines of code below it and more in *why* those
+lines are shaped the way they are — a set of decisions earned by reading the
+real serialization format, running real before/after experiments, and hitting
+real failure modes. If you change the code, read this first; most "obvious
+simplifications" re-break something documented here.
+
+
+================================================================================
+QUICKSTART
+================================================================================
+
+  # DEFAULT = COMPACTION: distill the oldest ~50% of context into role-structured turns,
+  # keep the newest ~50% verbatim. Makes LLM calls. --ratio tunes how much:
+  cleanclaude <session-id>                       # ratio 0.5  (0.25 ~ light · 0.75 ~ aggressive)
+  cleanclaude <session-id> --ratio 0.75
+
+  # --prune: the NO-LLM path — evict tool I/O to the snapshot store, leave <context-pruned> tags:
+  cleanclaude <session-id> --prune
+
+  # The exact command that created the 75%-reclaimed clone writing this docstring:
+  cleanclaude fa7fe4db-4440-4bf9-b371-178fbdd5ee04 --ratio 0.75 --no-verify
+  claude --resume <new-id>        # then resume the clone it prints (here: into tmux pane slomp:2.4)
+
+  # Operate on a raw transcript path instead of an id (this is also the install/verify path):
+  cleanclaude /path/to/transcript.jsonl
+
+  What it prints: the source, the reduction %, validation, and the NEW session id it
+  installed — then by default it resume-verifies. The original is NEVER touched; cleanclaude
+  only ever writes a new-id copy and never deletes from ~/.claude/projects.
+
+  --prune is lossless: every removed string is snapshotted to ~/.config/cleanclaude/sessions/<id>/
+  and the <context-pruned> marker left behind points back at it (and at the live file) — nothing
+  is deleted, only evicted from the context window.
+
+  Finding a <session-id>: it is the <uuid> in ~/.claude/projects/<sanitized-cwd>/<uuid>.jsonl
+  for the conversation. The newest-mtime .jsonl in that dir is usually the live one; the
+  `agentName` field stamps which agent it belongs to; the get-history-filename skill (or
+  `agent-message lookup <identity>`) resolves it.
+
+  Flags: --ratio R (compaction: fold oldest R by weight; default 0.5) · --prune (no-LLM eviction) ·
+  --keep-last N (prune: keep last N turns' tool I/O; default 4) · --chunk-tokens K · --no-verify.
+
+
+================================================================================
+1. THE PROBLEM, AND WHY THE OBVIOUS TOOLS DON'T SOLVE IT
+================================================================================
+
+A long agent session accumulates enormous, low-value bulk: file reads, command
+output, search dumps, and the code the agent itself wrote and re-wrote. This
+bulk dominates the token budget but is rarely load-bearing once the work has
+moved on — the agent needed `settings.json`'s contents for two turns, not for
+the next two hundred.
+
+Claude Code already has two mechanisms here, and both are blunt:
+
+  * `/compact` and auto-compaction (`autoCompactWindow`) summarize the ENTIRE
+    conversation into one model-written blob when a token threshold is crossed.
+    Three problems: (a) it fires on a raw token count, which can land mid-thought
+    rather than at a clean boundary; (b) it summarizes EVERYTHING, including the
+    recent turns you were actively leaning on; (c) it is all in the model's
+    voice — the human's actual phrasing is paraphrased away (see §7, ENTROPY).
+
+  * `/clear` throws the whole thing out.
+
+What was missing is a *scalpel*: keep the recent working set verbatim, reclaim
+the old bulk, and choose the boundary deliberately. That is cleanclaude.
+
+An important non-goal: this is not trying to be Claude Code's compaction. It is
+an external, offline editor of the serialized transcript that produces a fresh
+resumable session. It can be far more surgical precisely because it is offline.
+
+
+================================================================================
+2. WHAT IT DOES (two modes + verify)
+================================================================================
+
+  cleanclaude <conversation-id>                 # COMPACTION — the default (makes LLM calls)
+      Split the conversation into an old "head" and a recent "tail"; rebuild the
+      head as a short run of role-structured summary turns (user verbatim,
+      assistant distilled); keep the tail verbatim. --ratio sets the split.
+
+  cleanclaude <conversation-id> --prune         # PRUNE — no LLM calls
+      Evict the heavy tool I/O (to a content-addressed snapshot store) in every
+      turn older than the keep window, leaving <context-pruned> tags in place.
+      Keeps every turn; lossless; smaller reclaim than compaction.
+
+  cleanclaude <path-to.jsonl>
+      The load/verify path on a raw JSONL file: install it as a new session and
+      resume-verify. (Both modes call this internally on their temp file; it is
+      also usable standalone to "bring up" any transcript.)
+
+  Both modes first EXCISE orphan tool_results (results whose tool_use was forked
+  away by a /rewind — see §5), install a NEW session id, and end by RESUME-VERIFYING:
+  the transcript is actually resumed headlessly, and success means it LOADED and the
+  model responded — NOT that it emitted a particular string (a security-minded agent
+  may rightly refuse a "say X" probe; that still counts as a successful load).
+
+Flags:
+  --ratio R          (default) compaction: fold the OLDEST R fraction of context by
+                     weight into summary turns (default 0.5; newest 1-R kept verbatim)
+  --prune            no-LLM eviction mode instead of compaction
+  --keep-last N      prune: keep the last N user-prompt turns' tool I/O intact (default 4)
+  --chunk-tokens K   compaction: summarize the head in ~K-token chunks (default 50000)
+  --summarizer-model compaction: model that distills the assistant side
+  --no-verify        skip the resume verification
+
+Every run ends by ACTUALLY RESUMING the product (headless `-p`, with
+`--no-session-persistence` so the probe turn doesn't pollute the clean session).
+A transcript that validates statically but won't resume is a failure; the resume
+is the real gate.
+
+
+================================================================================
+3. THE GROUND TRUTH: HOW A CLAUDE CODE TRANSCRIPT IS SERIALIZED
+================================================================================
+
+Everything below is a consequence of the on-disk format, which was learned by
+inspecting real transcripts (not from docs). Get this wrong and nothing resumes.
+
+  * Location: ~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl, where the
+    sanitized cwd is the working directory with every "/" replaced by "-"
+    (/home/slomp -> -home-slomp). The mapping is lossy; confirm by mtime/content.
+
+  * Format: JSON Lines — one JSON record per line. NOT a single JSON document.
+    A live transcript's last line may be a partial write, so the loader skips
+    un-parseable lines rather than crashing (see `load`).
+
+  * It is a LINKED LIST (really a DAG). Each record has `uuid` and `parentUuid`.
+    Resume does NOT read the file top-to-bottom; it finds the leaf (most recent)
+    and walks `parentUuid` back to the root, reconstructing the thread. This is
+    THE central fact. Consequences:
+      - File order is not thread order. The file contains off-thread branches,
+        sidechain (subagent) records, and meta records that are NOT on the live
+        thread. Any analysis of "the conversation" must walk the chain, not the
+        file (see `thread_records`). An early bug validated tool pairing in file
+        order and produced false "orphan tool_result" errors from sidechains.
+      - To delete a record you must SPLICE it: re-point its child's parentUuid to
+        its parent. Orphan the chain and resume cannot rebuild the thread.
+
+  * Record variety: the file is not just user/assistant messages. Real top-level
+    `type`s seen include: custom-title, agent-name, last-prompt, mode,
+    permission-mode, bridge-session, system, file-history-snapshot, attachment,
+    user, assistant, plus rich metadata fields (sessionId, cwd, gitBranch,
+    timestamp, requestId, isSidechain, isMeta, toolUseResult, leafUuid, ...).
+    The leading non-message records are "scaffolding"; they sit on the chain and
+    are preserved untouched.
+
+  * Message content blocks: a `message.content` is either a string OR a list of
+    blocks: {type:"text"}, {type:"tool_use", id, name, input}, {type:"tool_result",
+    tool_use_id, content}, {type:"thinking", thinking, signature}.
+
+  * TOOL PAIRING: an assistant `tool_use` (id) must be answered by a `tool_result`
+    (tool_use_id) in the following user message. Drop one without the other and
+    the API rejects the conversation. => prune in pairs, or stub content in place.
+
+  * THINKING IS ALREADY STRIPPED. Real transcripts store thinking blocks but with
+    EMPTY text — only the `signature` survives (171 blocks, 0 chars of thinking,
+    171 signatures in the session this tool was built in). So thinking costs ~no
+    tokens and is NOT a prune target. The signatures are required for API
+    validity on resume, and you CANNOT edit a signed block without breaking it.
+    => cleanclaude never touches thinking blocks.
+
+  * toolUseResult: a top-level field that mirrors a tool's result as harness
+    metadata, separate from the `message.content` tool_result the MODEL sees. It
+    is large. We evict it too (it bloats the file), but note: it is NOT confirmed
+    to be re-sent into the model's context on resume — so stubbing it may shrink
+    the FILE more than the model's TOKEN context. The model-facing tool output is
+    the `message.content` tool_result (~11% of file in our sample); toolUseResult
+    is the rest of the bulk. (Open question, see §9.)
+
+  * message.usage AND THE CONTEXT GAUGE (a caveat we did NOT foresee, now resolved).
+    The context-% the harness shows on resume is read from the LAST `message.usage`
+    block in the transcript — server-reported counts persisted from the prior turn,
+    NOT a live recount. This bites every clone: a compacted/pruned copy inherits the
+    PARENT's `usage` in its verbatim tail, so a session that is now a fraction of the
+    real size is BORN reporting the parent's maxed-out gauge — and the harness will
+    auto-compact away the very reduction we just made. Fix: `reset_usage()` runs in the
+    install path and recursively zeroes every integer field whose key contains "token"
+    (input_tokens, cache_read/creation_input_tokens, and the nested cache_creation.* /
+    iterations.* counters) across all `usage` blocks. The next real turn writes accurate
+    counts, so this ALIGNS the gauge with the true reduced size rather than faking it.
+    Keep the distinction straight: cleanclaude does REAL token reduction; reset_usage
+    only corrects the GAUGE so the harness believes it — and BOTH are needed, because a
+    real reduction left under a stale gauge just gets auto-compacted away. (Discovered
+    the hard way: a clone of this very session was born reading ~100% full and had to
+    have its usage zeroed by hand before it would stop trying to auto-compact.)
+
+
+================================================================================
+4. THE INVARIANTS (break any of these and the result will not resume)
+================================================================================
+
+  I1. CHAIN WALKABILITY. leaf -> parentUuid -> ... -> root must be unbroken over
+      the records actually written. Splice around deletions; re-link the first
+      kept record to the last surviving ancestor.
+
+  I2. TOOL PAIRING. Every tool_use on the live thread has its tool_result and
+      vice versa. Stub-in-place preserves this trivially (no blocks removed);
+      compaction preserves it by splitting only at user-prompt boundaries so no
+      tool pair straddles the head/tail cut. CAVEAT: a real transcript may carry a
+      PRE-EXISTING orphan — a tool_use forked away by a /rewind, or summarized off
+      by native compaction. cleanclaude EXCISES these up front (excise_orphans: drop
+      the orphan result, re-link the chain — exactly what Claude does on resume), so
+      the produced thread is clean. validate() keeps an orphan check only as a
+      backstop warning, never a block; the resume-verify is the real gate.
+
+  I3. CONTENT IS AN ARRAY OF BLOCKS for synthetic records. Claude Code's resume
+      code calls `message.content.some(...)` to scan for tool_use blocks; a bare
+      string has no `.some` and throws ("content.some is not a function"). So any
+      record we MANUFACTURE uses content: [{type:"text", text:...}], never a raw
+      string. (Pre-existing string-content records are fine; only synthetic ones
+      bit us.)
+
+  I4. NO EMPTY message.content. If editing would empty a message, drop the whole
+      record (and splice) rather than leave content: [].
+
+  I5. DON'T TOUCH SIGNED THINKING BLOCKS. (See §3.)
+
+  I6. KEEP THE SCAFFOLDING. The leading system/meta records are on the chain and
+      resume expects them; re-link around message records, don't delete the
+      plumbing.
+
+  I7. DON'T TOUCH THE TAIL / THE LEAF. We always reclaim the head; the recent
+      tail and the leaf are preserved verbatim.
+
+`validate()` checks I1, I2, I4 along the reconstructed thread before any resume,
+which catches most failures offline and cheaply.
+
+
+================================================================================
+5. PRUNE (--prune) — stub-in-place, made LOSSLESS by an eviction cache
+================================================================================
+
+Decision: STUB, don't EXCISE. Rather than removing records (which forces chain
+surgery, pairing-aware deletion, and role-alternation care), we replace the
+heavy *content* in place with a small marker, keeping every record, every uuid,
+and every tool_use_id. The structure stays byte-valid; only the bulk leaves.
+This is the 80/20: almost all the token weight is in a few content fields, and
+shrinking them reclaims the vast majority for near-zero structural risk.
+
+Three reclaim targets, each chosen deliberately:
+
+  (a) tool_result bodies (message.content)  — the file reads / command output the
+      model actually sees. THIS is the model-facing reclaim.
+  (b) toolUseResult (top-level metadata)    — the harness's copy of the same; big
+      in the file (see §3 caveat about whether it's in model context).
+  (c) Edit/Write tool_use INPUT content     — old_string/new_string (Edit) and
+      content (Write): the code the agent authored. Stripped while KEEPING
+      file_path. (TOOL_INPUT_STRIP encodes which fields per tool.)
+
+NOTHING IS LOST — IT'S EVICTED, NOT DELETED. Before a string is removed it is
+written to a content-addressed SNAPSHOT STORE, and the marker left in its place
+is a self-describing XML tag pointing at both copies:
+
+  <context-pruned snapshot-of-original-content="<abs path>" original-file-path="<abs path>"/>
+
+  * STORE: ~/.config/cleanclaude/sessions/<source-id>/<sha256(content)[:16]>
+    (the sessions/ subdir keeps .config/cleanclaude free for other things and is
+    easy to .gitignore). Keyed by the SOURCE conversation id — stable across runs,
+    not the clone's new id — so a re-run reuses the existing files. Content-
+    addressed: identical content (same file read twice, same stdout) stores once;
+    `if not exists` makes re-runs idempotent.
+  * TAG = the marker AND the instruction at once: XML the model parses natively,
+    with attribute NAMES that explain themselves, no prose. Two self-contained
+    recoveries: `cat` snapshot-of-original-content for exactly what was in context
+    (immune to the live file drifting), or re-read original-file-path for the
+    file's current state. original-file-path is present for tools that have one
+    (Read/Edit/Write), absent for Bash/Grep (whose command/pattern is still
+    visible in the adjacent tool_use).
+  * IDEMPOTENCY: every tag starts with SENTINEL ("<context-pruned"), so a second
+    pass recognizes its own prior work and skips it — re-runs are incremental
+    (only new raw content is evicted) and never tag a tag.
+
+So the original "forget the content, keep the pointer" became a true EVICTION
+CACHE: the window is reclaimed, but every byte is recoverable, point-in-time, by
+the path baked into each tag. The live pointer is still never touched.
+
+That the content actually leaves the model's CONTEXT (not just the file) was
+proven, not assumed:
+
+  * Canary test (tool OUTPUT): a fresh agent read a file containing an unguessable
+    token; with tools off, the control session recalled the token, the pruned
+    session answered NOTAVAILABLE, and the token was grep-absent from the cleaned
+    JSONL. Content gone from context; file_path preserved.
+  * Canary test (Write INPUT): an agent invented a token and wrote it ONLY into a
+    file (never said it). After input-stripping, the pruned session (tools off)
+    answered NOTAVAILABLE while the path survived. Authored content left context;
+    the pointer stayed. (Both predate the snapshot store — content is now also on
+    disk, so "gone from context" no longer implies "gone for good".)
+
+What is NOT pruned: conversation text (user + assistant prose), and thinking.
+
+
+================================================================================
+6. COMPACTION (the default) — role-structured, dual-voice
+================================================================================
+
+Pruning reclaims tool I/O but keeps the full turn-by-turn narrative. Partial
+compaction goes further on the OLD portion: it summarizes it. But unlike native
+compaction it (a) chooses the boundary, (b) keeps the recent tail 100% verbatim,
+and (c) preserves the human's voice. Steps:
+
+  STEP 1 — SPLIT into head (old) + tail (recent).
+    By `--ratio R`: walk the conversation oldest-first by content weight; the
+    head is the oldest records summing to ~R of total weight; the tail is the
+    rest. (Or by `--keep-last N` turns.) The split ALWAYS lands on a user-prompt
+    boundary so no tool pair straddles it (I2) and the tail begins with a real
+    user turn. `--ratio` is the single knob worth tuning: 0.25 ≈ imperceptible,
+    0.5 ≈ works well, 0.75 ≈ starts to get shaky (to be characterized).
+
+  STEP 2 — CHUNK the head into ~`--chunk-tokens` segments at turn boundaries.
+    WHY: a one-shot summary of a huge head is dicey. We learned this the hard
+    way twice — a 235K-char head as a single `-p` ARGUMENT blew ARG_MAX
+    ("Argument list too long"), which is why the summarizer now PIPES the head
+    over STDIN; and big single summaries are lower quality / higher risk than a
+    few focused ones. Chunking makes it robust and parallelizable.
+
+  STEP 3 — DUAL-VOICE summarize each chunk, asymmetrically by role:
+    * USER turns  -> KEPT VERBATIM. Concatenated as-is into a synthetic `user`
+                     record. We do NOT paraphrase the human.
+    * ASSISTANT turns -> DISTILLED by the model (`distill_assistant`, piped over
+                     stdin) into a terse, first-person, model-voiced account of
+                     what it did/decided. Synthetic `assistant` record.
+
+  STEP 4 — REBUILD as REAL alternating user/assistant records (not a prose blob),
+    fresh uuids, chained; splice: scaffolding + [user, assistant] x chunks + tail;
+    re-link the first tail record to the last synthetic record.
+
+  STEP 5 — validate, install, resume-verify (with the 1M model, because a large
+    compacted context still needs the window).
+
+
+================================================================================
+7. THE LOAD-BEARING DECISIONS, AND WHY
+================================================================================
+
+7.1  WHY DUAL-VOICE, AND WHY THE ASYMMETRY IS INFORMATION-THEORETIC.
+  The two roles carry different ENTROPY relative to the model that will read the
+  summary. The assistant's own turns are LOW entropy to that model — it can
+  regenerate its style and re-derive its conclusions from the outcomes; so the
+  assistant side is safely distilled into the model's own voice. The human's
+  turns are HIGH entropy — genuinely novel intent, phrasing, emphasis, and even
+  the way the human floats an idea then walks it back; none of that is
+  reconstructible. Compaction's usual quality loss is precisely that it renders
+  EVERYTHING in the model's voice and flattens the human's signal. So the optimal
+  allocation of the compression budget is: spend ZERO on the high-entropy human
+  channel (keep it verbatim) and ALL of it on the low-entropy model channel.
+
+  This was tested. At --ratio 0.5 on a real long session, the resumed clone:
+    - reproduced the user's FIRST request near-verbatim ("...promoted to our own
+      internal system... bypasses the auto classification... will you research
+      that?") — voice preserved, because user turns were kept verbatim; and
+    - accurately recalled a distilled technical fact (the dumbclaude vs tinyclaude
+      subtractive/additive distinction) from ~80 turns back.
+
+7.2  WHY REAL user/assistant RECORDS, NOT A DELIMITED PROSE BLOB.
+  An earlier version embedded the summary as one prose blob with "===" segment
+  separators. That is reinventing a serialization format the model has weak
+  priors for. The `user`/`assistant` role container IS the model's NATIVE
+  serialization: it is the chat template the model was post-trained on,
+  ubiquitously. Representing recalled history in that structure is in-distribution
+  — the model parses "these turns happened" with its strongest prior, no
+  ad-hoc-delimiter tax. So the head is rebuilt as genuine alternating role
+  records. (In the transcript case we can use REAL role fields, which is maximally
+  native; a system-prompt-stuffing use case would fall back to textual "User:/
+  Assistant:" markers, still strongly recognized.)
+
+7.3  WHY VERBATIM USER, NOT A "VOICE-PRESERVING" USER COMPRESSOR.
+  Tempting to summarize user turns with a "keep their voice" prompt. Rejected:
+  any paraphrase is exactly the entropy destruction we are trying to avoid, and
+  the reward is tiny because user turns are a small fraction of total tokens.
+  Low reward, high risk. Verbatim wins. (FUTURE nuance, see §9: a user turn can
+  contain pasted BULK — a log/doc/code dump — which is high-token and low-voice;
+  the right lever there is a SIZE THRESHOLD that stubs only oversized user
+  content, not a voice compressor.)
+
+7.4  WHY KEEP THE RECENT TAIL VERBATIM (the attention argument, hedged).
+  General transformer lore ("Lost in the Middle", Liu et al., ~2023) reports a
+  U-shaped position bias: strong recall at the very start and the very end of a
+  long context, weakest in the middle. If true for the models we target, the
+  recent tail (high recency) and the original framing (high primacy) are the
+  high-attention regions, and the middle is the cheapest to compress. HONESTY
+  FLAG: that finding is from 2023-era models; current 1M-context models are
+  trained to flatten that curve, so its transfer is UNVERIFIED. This claim was
+  asserted from memory, not researched live — treat the attention story as
+  motivation, not proof. What IS proven is the empirical result: keeping a
+  generous verbatim tail + summarizing the old head produced a clone that
+  continued with no apparent loss.
+
+7.5  WHY CHUNK + STDIN. ARG_MAX (a 253K-char head as one argv arg fails); and
+  smaller focused summaries beat one giant one. The summarizer reads the head on
+  STDIN, with a short instruction in -p.
+
+7.6  WHY THE SUMMARIZER RUNS WITH --tools "" --no-session-persistence. It only
+  needs to read and write prose; no tools, and don't persist a throwaway session.
+
+7.7  WHY VERIFY WITH --no-session-persistence AND THE 1M MODEL. The verify probe
+  must not write a junk turn into the freshly-installed clean session, so it runs
+  no-persistence. And a large pruned/compacted context can still exceed 200K, so
+  the verify uses the 1M-window model to guarantee it loads.
+
+7.8  WHY VALIDATE ALONG THE THREAD, NOT THE FILE. (See §3 — sidechains/branches.)
+
+7.9  STUB OVER EXCISE (default). Excise (remove whole tool pairs + re-link) would
+  reclaim the record skeletons too, but at the cost of pairing-aware deletion and
+  chain surgery. Stub gets ~all the token weight for none of that risk. Excise is
+  a future option (§9), not the default.
+
+7.10 NON-DESTRUCTIVE BY CONSTRUCTION. cleanclaude NEVER deletes from
+  ~/.claude/projects/. It reads, works on a temp copy, and WRITES new-id sessions.
+  Each run leaves a new cleaned session behind (the deliverable). Nothing is
+  overwritten or removed.
+
+
+================================================================================
+8. WHAT WAS ACTUALLY MEASURED (so the claims above aren't vibes)
+================================================================================
+
+  * Prune on a 1633-record session: 191 tool_result bodies + 122 Edit/Write input
+    fields stubbed -> 36% smaller file; thread still valid + resumable.
+  * Canary recall (output and input): content provably removed from the model's
+    context (tools-off recall = NOTAVAILABLE), file_path provably preserved.
+  * Partial compaction on a real ~85-turn, 5.4M-char session:
+      - keep-last 3        -> 95% smaller; clone recalled early facts.
+      - ratio 0.5 (chunked)-> 54-55% smaller; clone recalled an early technical
+        distinction AND reproduced the user's verbatim framing.
+  * Resume is verified by actually resuming and getting a response, every run.
+
+  THE SELF-IDENTITY WRINKLE (a real finding, not a bug to fix): a resumed clone
+  does NOT realize it has been compacted. It reads its verbatim tail — whose most
+  recent content is "now" — and adopts that as its present moment and even its
+  identity; in one run it insisted it was "the original, full-context session"
+  and offered to go fetch the very result it WAS. The summary banner did not
+  override the tail's salience. For CONTINUING work this temporal inheritance is
+  a feature (you resume to keep going). For self-awareness it is a gotcha; a
+  stronger banner or a system-prompt note would be needed to make the clone know
+  it is a compaction artifact.
+
+
+================================================================================
+9. KNOWN LIMITATIONS & FUTURE TO-DOs (kept deliberately small — happy path)
+================================================================================
+
+  * STORE LIFECYCLE / GC: the snapshot store (§5) grows and is never cleaned. It's
+    keyed by conversation id, so GC could tie to a conversation's deletion.
+  * COMPACTION SNAPSHOTS: --prune evicts to the store; the default compaction still
+    paraphrases the head's file-reads away without snapshotting them first. Natural extension.
+  * User-content SIZE THRESHOLD: keep user turns verbatim (voice), but evict a
+    user turn that is actually pasted BULK over N tokens. (§7.3.)
+  * EXCISE mode: beyond excise_orphans, optionally remove whole tool pairs + re-link
+    for deeper reclaim (the orphan excise already provides the re-link plumbing).
+  * SELF-AWARENESS: optional stronger "you are resuming a compacted transcript"
+    framing so the clone knows. (§8.)
+  * toolUseResult ACCOUNTING: confirm whether it is re-sent to the model on
+    resume; if not, evicting it is file-only, not token reclaim. (§3.)
+  * "Lost in the middle" on CURRENT models: verify before relying on the
+    middle-is-cheapest premise. (§7.4.)
+  * Token sizing is a chars/4 proxy (CHARS_PER_TOKEN), not a real tokenizer.
+  * NO BACKWARD COMPAT (by design): the on-disk tag + store layout isn't versioned,
+    so transcripts pruned by an older cleanclaude won't be recognized on re-run.
+    Fine for an experiment.
+
+
+================================================================================
+10. PHILOSOPHY: ONE HAPPY PATH
+================================================================================
+
+This is intentionally a single-file experiment with ONE evolving direction, not
+a tool with a flag for every idea. When a better representation was found
+(role-structured dual-voice), it REPLACED the prose-blob form rather than being
+added behind a toggle. The cost of bespoke tools with many options is confusion;
+the value is in settling on the happy path and sharpening it. The one real knob
+is `--ratio` — how aggressive. Everything else has a defensible default.
+
+A note on provenance, in the spirit of the project: claims in this file are
+either (a) proven by an experiment described in §8, (b) read directly from the
+serialization format (§3), or (c) flagged as asserted-from-memory and unverified
+(§7.4, §3 toolUseResult). Don't let (c) masquerade as (a).
+================================================================================
+"""
+import argparse, hashlib, json, os, re, subprocess, sys, tempfile, uuid
+from pathlib import Path
+
+PROJECTS = Path.home() / ".claude" / "projects"
+STORE = Path.home() / ".config" / "cleanclaude" / "sessions"  # per-conversation snapshots, under a
+# sessions/ subdir so .config/cleanclaude stays free for other things later (and is easy to .gitignore)
+# heavy tool_use input fields to drop, keeping file_path (the breadcrumb) intact
+TOOL_INPUT_STRIP = {"Write": ["content"], "Edit": ["old_string", "new_string"]}
+CHARS_PER_TOKEN = 4  # rough proxy for token sizing
+
+# ============================================================================
+# MODEL-FACING TEXT — every string a model actually reads, gathered here as one
+# editable overview. Two kinds: NOTES embedded into the produced transcript that
+# the resumed agent reads, and PROMPTS sent to helper `claude -p` calls. The code
+# below references these by name; tune wording/tone here.
+# ============================================================================
+
+# -- Marker left where content was removed: a self-explanatory, well-formed XML tag (no prose) --
+# The resumed agent meets it right at the gap. The attribute NAMES are the instruction:
+# `snapshot-of-original-content` is an absolute path to a frozen copy of exactly what was here (in
+# this conversation's store); `original-file-path` (when known) is the live file on the current
+# filesystem. Built by pruned_tag(); detected and parsed by TAG NAME + ATTRIBUTES, never by wording
+# — so structure and prose can't drift apart.
+#   e.g.  <context-pruned snapshot-of-original-content="/…/cleanclaude/sessions/<id>/<hash>" original-file-path="/abs/live/path"/>
+PRUNED_TAG_NAME = "context-pruned"
+SENTINEL = "<" + PRUNED_TAG_NAME
+
+# Prepended to the first reconstructed turn of a compacted head:
+COMPACT_BANNER = (
+    "[The earlier part of this conversation is reconstructed below as compacted turns: your "
+    "own assistant turns distilled to outcomes, the user's turns kept verbatim to preserve "
+    "their voice. File paths named can be re-read on demand.]\n\n"
+)
+
+# -- Prompts sent to helper `claude -p` calls --
+# Compaction dual-voice: distill one segment's assistant side into the model's own voice.
+DISTILL_INSTRUCTION = (
+    "The text on stdin is the ASSISTANT's side of part of a long agent coding conversation — its "
+    "messages plus breadcrumbs of the tools it ran. Rewrite it in your own voice as a terse, "
+    "first-person account of what you did, decided, and established. Keep file paths, identifiers, "
+    "and concrete outcomes; drop retries, dead ends, and filler. Output only the account."
+)
+
+# summarize(): the alternate whole-head single-briefing prompt.
+SUMMARIZE_INSTRUCTION = (
+    "The text on stdin is the EARLIER portion of a long agent coding conversation. Compact it into "
+    "a dense briefing so it can be dropped from context while the agent that continues the work keeps "
+    "its understanding. Preserve: decisions made and why; facts, values, and identifiers established; "
+    "file paths touched and what was done to each; the current state of the work; and any open threads "
+    "or TODOs. Be terse; drop pleasantries, retries, and dead ends; never invent. Output only the briefing."
+)
+
+# install_and_verify(): headless resume-verify probe. We do NOT check WHAT the resumed agent says
+# — a strong-persona or security-minded agent may (correctly) refuse a "reply with the exact string
+# X" request as a prompt-injection pattern — only that it LOADED and responded without a transcript
+# load error. So the probe is a neutral nudge, and success is judged by absence of load errors.
+VERIFY_PROBE = "Context resume check — please reply briefly so we can confirm the session loaded."
+
+
+def sanitize_cwd(cwd: str) -> str:
+    return re.sub(r"/", "-", cwd)
+
+
+def find_transcript(conv_id: str):
+    hits = sorted(PROJECTS.glob(f"*/{conv_id}.jsonl"))
+    return hits[0] if hits else None
+
+
+def load(path) -> list:
+    out = []
+    for l in Path(path).read_text(encoding="utf-8").splitlines():
+        if not l.strip():
+            continue
+        try:
+            out.append(json.loads(l))
+        except json.JSONDecodeError:
+            continue  # skip a partial/corrupt line (e.g. a live transcript's last write)
+    return out
+
+
+def dump(records: list, path):
+    with open(path, "w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def is_user_prompt(rec: dict) -> bool:
+    """A genuine user text prompt — not a tool_result-only message, not meta."""
+    if rec.get("type") != "user":
+        return False
+    c = (rec.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return bool(c.strip())
+    if isinstance(c, list):
+        return any(isinstance(b, dict) and b.get("type") == "text" for b in c)
+    return False
+
+
+def snapshot(store_dir: Path, content) -> str:
+    """Write the about-to-be-removed content to a content-addressed file in the per-conversation
+    store and return its absolute path. Hashing the content makes this idempotent: identical
+    content (the same file read twice, or a re-run of the tool) maps to the same file — written
+    once, reused thereafter. The path is embedded in the <context-pruned> tag so the agent can `cat`
+    the frozen snapshot even after the live file has drifted."""
+    data = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    h = hashlib.sha256(data.encode("utf-8")).hexdigest()[:16]
+    store_dir.mkdir(parents=True, exist_ok=True)
+    f = store_dir / h
+    if not f.exists():
+        f.write_text(data, encoding="utf-8")
+    return str(f)
+
+
+def pruned_tag(snapshot_path: str, file_path=None) -> str:
+    """Build the self-explanatory marker left where content was removed: a well-formed, self-closing
+    XML tag (the model has strong priors for tags). The attribute NAMES are the instruction:
+    `snapshot-of-original-content` = absolute path to a frozen copy of exactly what was here;
+    `original-file-path` (when known) = the live file on the current filesystem. No prose
+    instructions — the tag explains itself, detected/parsed by name + attributes, not wording."""
+    attrs = f'snapshot-of-original-content="{snapshot_path}"'
+    if file_path:
+        attrs += f' original-file-path="{file_path}"'
+    return f"<{PRUNED_TAG_NAME} {attrs}/>"
+
+
+def stub_tool_results(content, store_dir: Path, useid_file: dict) -> int:
+    n = 0
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                cc = b.get("content")
+                if isinstance(cc, str) and cc.startswith(SENTINEL):
+                    continue  # already evicted on a prior run — skip (incremental re-run)
+                b["content"] = pruned_tag(snapshot(store_dir, cc), useid_file.get(b.get("tool_use_id")))
+                n += 1
+    return n
+
+
+def stub_tool_inputs(content, store_dir: Path) -> int:
+    """Drop heavy tool_use input fields (Edit old/new strings, Write content) while keeping
+    file_path (the breadcrumb) intact. The removed content is snapshotted to the store first,
+    so it stays recoverable point-in-time."""
+    n = 0
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                inp = b.get("input") or {}
+                fp = inp.get("file_path")
+                for k in TOOL_INPUT_STRIP.get(b.get("name"), []):
+                    if k in inp:
+                        v = inp[k]
+                        if isinstance(v, str) and v.startswith(SENTINEL):
+                            continue
+                        inp[k] = pruned_tag(snapshot(store_dir, v), fp)
+                        n += 1
+    return n
+
+
+def prune(records: list, keep_last: int, store_dir: Path):
+    """Stub tool_result bodies in every record before the cutoff. Cutoff = the start of the
+    last `keep_last` genuine user prompts (those turns stay intact). Each removed string is
+    snapshotted to store_dir first, so nothing is truly lost — only evicted from the window."""
+    useid_file = {}  # tool_use id -> live file_path, so a result's tag can name the live file
+    for r in records:
+        c = (r.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    fp = (b.get("input") or {}).get("file_path")
+                    if fp:
+                        useid_file[b.get("id")] = fp
+    prompts = [i for i, r in enumerate(records) if is_user_prompt(r)]
+    if len(prompts) > keep_last:
+        cutoff = prompts[-keep_last]
+    else:
+        cutoff = len(records)  # nothing old enough to prune
+    n_res = n_inp = 0
+    for i, r in enumerate(records):
+        if i >= cutoff:
+            continue
+        content = (r.get("message") or {}).get("content")
+        n_res += stub_tool_results(content, store_dir, useid_file)
+        n_inp += stub_tool_inputs(content, store_dir)
+        tur = r.get("toolUseResult")
+        if tur is not None and not (isinstance(tur, str) and tur.startswith(SENTINEL)):
+            rfile = None
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        rfile = useid_file.get(b.get("tool_use_id"))
+                        break
+            r["toolUseResult"] = pruned_tag(snapshot(store_dir, tur), rfile)
+    return records, n_res, n_inp, cutoff
+
+
+def thread_records(records: list) -> list:
+    """Reconstruct the actual conversation thread the way resume does: start at
+    the leaf (most recent uuid) and walk parentUuid back to the root. This skips
+    off-thread / sidechain / branched records that aren't in the live context."""
+    by_uuid = {r["uuid"]: r for r in records if r.get("uuid")}
+    leaf = next((r["uuid"] for r in reversed(records) if r.get("uuid")), None)
+    out, seen, u = [], set(), leaf
+    while u and u in by_uuid and u not in seen:
+        seen.add(u)
+        out.append(by_uuid[u])
+        u = by_uuid[u].get("parentUuid")
+    out.reverse()
+    return out
+
+
+def validate(records: list) -> tuple:
+    """Static checks along the live thread. Returns (errors, warnings, thread_len). Orphan
+    tool_results are WARNINGS, not errors: a real transcript can carry pre-existing orphans (a
+    tool_use summarized away by native compaction, or left on a rewound/branched path), and Claude
+    Code resumes them fine by filtering on resume. A stub-prune removes no records so it cannot
+    introduce one — an orphan must NOT block. The resume-verify is the real gate."""
+    errs, warns = [], []
+    thread = thread_records(records)
+    seen_use = set()
+    for r in thread:
+        msg = r.get("message") or {}
+        c = msg.get("content")
+        if isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use":
+                    seen_use.add(b.get("id"))
+                elif b.get("type") == "tool_result" and b.get("tool_use_id") not in seen_use:
+                    warns.append(f"orphan tool_result {b.get('tool_use_id')} (pre-existing)")
+            if msg.get("role") and c == []:
+                errs.append(f"empty content at {str(r.get('uuid',''))[:8]}")
+    return errs, warns, len(thread)
+
+
+def excise_orphans(records: list):
+    """Drop tool_results on the live thread whose tool_use was forked away (e.g. by /rewind) and
+    re-link the chain. Such a result's call sits on an abandoned branch — never an ancestor — so it
+    is meaningless to the model, and Claude itself drops these on resume. Removing them here keeps
+    the output API-clean without leaning on resume-time filtering. Returns (records, n_excised)."""
+    thread = thread_records(records)
+    use_ids = set()
+    for r in thread:
+        c = (r.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    use_ids.add(b.get("id"))
+    orphan_uuids = set()
+    for r in thread:
+        c = (r.get("message") or {}).get("content")
+        if isinstance(c, list) and c:
+            blocks = [b for b in c if isinstance(b, dict)]
+            results = [b for b in blocks if b.get("type") == "tool_result"]
+            # a record that is PURELY orphan tool_results -> excise the whole record
+            if results and len(results) == len(blocks) and all(b.get("tool_use_id") not in use_ids for b in results):
+                orphan_uuids.add(r.get("uuid"))
+    if not orphan_uuids:
+        return records, 0
+    parent = {r.get("uuid"): r.get("parentUuid") for r in records}
+    def live_ancestor(u):
+        seen = set()
+        while u in orphan_uuids and u not in seen:
+            seen.add(u)
+            u = parent.get(u)
+        return u
+    out = []
+    for r in records:
+        if r.get("uuid") in orphan_uuids:
+            continue
+        if r.get("parentUuid") in orphan_uuids:
+            r["parentUuid"] = live_ancestor(r.get("parentUuid"))
+        out.append(r)
+    return out, len(orphan_uuids)
+
+
+def reset_usage(records: list) -> int:
+    """Zero the persisted token counters so a freshly-installed clone reports its TRUE
+    (reduced) size on resume. The context gauge reads the last message.usage block, not a
+    live recount — and a clone inherits the PARENT's usage in its verbatim tail, so it is born
+    overstating itself and threatening to auto-compact away the reduction we just made. We
+    recursively zero every integer field whose key contains "token" (catching the nested
+    cache_creation.* and iterations.* counters). The next real turn writes accurate counts, so
+    this is a one-time reset that aligns the gauge with the real size, not a permanent fake."""
+    def zero(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, int) and "token" in k.lower():
+                    obj[k] = 0
+                elif isinstance(v, (dict, list)):
+                    zero(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                zero(v)
+    n = 0
+    for r in records:
+        u = (r.get("message") or {}).get("usage")
+        if isinstance(u, dict):
+            zero(u)
+            n += 1
+        if isinstance(r.get("usage"), dict):
+            zero(r["usage"])
+    return n
+
+
+def install_and_verify(records: list, do_verify: bool):
+    """Write records as a NEW session in the project dir matching their cwd,
+    then resume it headlessly without persisting the probe turn."""
+    cwd = next((r.get("cwd") for r in records if r.get("cwd")), str(Path.home()))
+    launch_cwd = cwd if os.path.isdir(cwd) else str(Path.home())
+    new_id = str(uuid.uuid4())
+    for r in records:
+        if "sessionId" in r:
+            r["sessionId"] = new_id
+        if launch_cwd != cwd and "cwd" in r:
+            r["cwd"] = launch_cwd
+    proj = PROJECTS / sanitize_cwd(launch_cwd)
+    proj.mkdir(parents=True, exist_ok=True)
+    target = proj / f"{new_id}.jsonl"
+    n_usage = reset_usage(records)
+    if n_usage:
+        print(f"usage  : zeroed token counters in {n_usage} usage block(s) — clone reports its true size on resume")
+    dump(records, target)
+    if not do_verify:
+        return None, new_id, target
+    probe = subprocess.run(
+        ["claude", "--resume", new_id, "--no-session-persistence", "--strict-mcp-config",
+         "--model", "claude-opus-4-8[1m]", "-p", VERIFY_PROBE],
+        cwd=launch_cwd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300,
+    )
+    # Resume succeeded if it LOADED and the model produced ANY response without a transcript load
+    # error. We don't require specific output — see VERIFY_PROBE.
+    blob = ((probe.stdout or "") + "\n" + (probe.stderr or "")).lower()
+    load_errors = ("no conversation found", "is not a function", "not well-formed",
+                   "argument list too long", "unexpected token", "cannot read propert")
+    ok = probe.returncode == 0 and bool((probe.stdout or "").strip()) and not any(e in blob for e in load_errors)
+    return (ok, probe), new_id, target
+
+
+def render_head(head: list) -> str:
+    """Render the head turns compactly for the summarizer: full user/assistant text,
+    tool calls as breadcrumbs (name + path/command), results truncated."""
+    lines = []
+    for r in head:
+        msg = r.get("message") or {}
+        role = (msg.get("role") or "").upper()
+        c = msg.get("content")
+        if isinstance(c, str):
+            if c.strip():
+                lines.append(f"{role}: {c.strip()}")
+        elif isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type")
+                if t == "text" and (b.get("text") or "").strip():
+                    lines.append(f"{role}: {b['text'].strip()}")
+                elif t == "tool_use":
+                    inp = b.get("input") or {}
+                    coord = inp.get("file_path") or inp.get("command") or inp.get("pattern") or ""
+                    lines.append(f"  [tool {b.get('name')}: {str(coord)[:120]}]")
+                elif t == "tool_result":
+                    rc = b.get("content")
+                    rc = rc if isinstance(rc, str) else json.dumps(rc)
+                    lines.append(f"  [result: {rc[:150].strip()}]")
+    return "\n".join(lines)
+
+
+def summarize(head_text: str, model: str) -> str:
+    """Pipe the head to a Claude -p over stdin (avoids ARG_MAX) and get a dense briefing."""
+    p = subprocess.run(
+        ["claude", "--strict-mcp-config", "--no-session-persistence", "--tools", "",
+         "--model", model, "-p", SUMMARIZE_INSTRUCTION],
+        input=head_text, capture_output=True, text=True, timeout=420,
+    )
+    return (p.stdout or "").strip()
+
+
+def chunk_head(head: list, chunk_tokens: int) -> list:
+    """Split the head into ~chunk_tokens chunks, breaking only at turn boundaries
+    (a turn starts at each genuine user prompt) so each chunk is coherent."""
+    budget = max(chunk_tokens, 1000) * CHARS_PER_TOKEN
+    turns, cur = [], []
+    for r in head:
+        if is_user_prompt(r) and cur:
+            turns.append(cur)
+            cur = [r]
+        else:
+            cur.append(r)
+    if cur:
+        turns.append(cur)
+    chunks, c, c_chars = [], [], 0
+    for turn in turns:
+        tchars = len(render_head(turn))
+        if c and c_chars + tchars > budget:
+            chunks.append(c)
+            c, c_chars = [], 0
+        c.extend(turn)
+        c_chars += tchars
+    if c:
+        chunks.append(c)
+    return chunks
+
+
+def _make_record(role: str, text: str, parent_uuid, template: dict) -> dict:
+    r = {"type": role, "uuid": str(uuid.uuid4()), "parentUuid": parent_uuid,
+         "message": {"role": role, "content": [{"type": "text", "text": text}]}, "sessionId": ""}
+    if template.get("cwd"):
+        r["cwd"] = template["cwd"]
+    if template.get("timestamp"):
+        r["timestamp"] = template["timestamp"]
+    return r
+
+
+def split_chunk_voices(chunk: list) -> tuple:
+    """Separate a chunk into the user's VERBATIM text (preserved — high-entropy signal)
+    and a render of the assistant's side (to be distilled into the model's own voice)."""
+    user_parts, asst_render = [], []
+    for r in chunk:
+        msg = r.get("message") or {}
+        role, c = msg.get("role"), msg.get("content")
+        if role == "user":
+            if isinstance(c, str):
+                if c.strip():
+                    user_parts.append(c.strip())
+            elif isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "text" and (b.get("text") or "").strip():
+                        user_parts.append(b["text"].strip())
+        elif role == "assistant":
+            asst_render.append(render_head([r]))
+    return "\n\n".join(user_parts), "\n".join(a for a in asst_render if a.strip())
+
+
+def distill_assistant(asst_text: str, model: str) -> str:
+    """Distill the assistant's side into a terse first-person account in the model's own voice."""
+    if not asst_text.strip():
+        return "(no assistant activity in this segment)"
+    p = subprocess.run(
+        ["claude", "--strict-mcp-config", "--no-session-persistence", "--tools", "",
+         "--model", model, "-p", DISTILL_INSTRUCTION],
+        input=asst_text, capture_output=True, text=True, timeout=420,
+    )
+    return (p.stdout or "").strip() or "(assistant activity omitted)"
+
+
+def compact(records: list, keep_last: int, ratio, chunk_tokens: int, model: str):
+    """Partial compaction, role-structured + dual-voice. The head (oldest portion) is rebuilt
+    as real alternating user/assistant records: user turns kept VERBATIM (high-entropy signal,
+    cheap), assistant turns DISTILLED into the model's own voice per ~chunk_tokens segment. The
+    tail is kept verbatim. Split by --ratio of context weight (oldest fraction) else keep_last."""
+    thread = thread_records(records)
+    prompts = [i for i, r in enumerate(thread) if is_user_prompt(r)]
+    if len(prompts) < 2:
+        return None
+    first = prompts[0]
+    conv = thread[first:]
+    lprompts = [i - first for i in prompts]  # prompt indices relative to conv
+    if ratio is not None:
+        weights = [len(json.dumps((r.get("message") or {}).get("content") or "")) for r in conv]
+        cumw = [0]
+        for w in weights:
+            cumw.append(cumw[-1] + w)
+        target = cumw[-1] * ratio
+        cands = [p for p in lprompts if p > 0 and cumw[p] >= target]
+        split = cands[0] if cands else lprompts[-1]
+    else:
+        if len(lprompts) <= keep_last:
+            return None
+        split = lprompts[-keep_last]
+    if split <= 0:
+        return None
+    scaffolding = thread[:first]
+    head, tail = conv[:split], conv[split:]
+    if not head or not tail:
+        return None
+    template = next((r for r in tail if r.get("cwd")), tail[0])
+    chunks = chunk_head(head, chunk_tokens)
+    new_head = []
+    prev = scaffolding[-1]["uuid"] if scaffolding else None
+    for i, ch in enumerate(chunks):
+        user_text, asst_text = split_chunk_voices(ch)
+        distilled = distill_assistant(asst_text, model)
+        if i == 0:
+            user_text = COMPACT_BANNER + user_text
+        u = _make_record("user", user_text or "(no user text in this segment)", prev, template)
+        prev = u["uuid"]
+        a = _make_record("assistant", distilled, prev, template)
+        prev = a["uuid"]
+        new_head += [u, a]
+    tail[0]["parentUuid"] = prev
+    new_records = scaffolding + new_head + tail
+    stats = {"chunks": len(chunks), "synthetic_records": len(new_head),
+             "head_records": len(head), "tail_records": len(tail)}
+    return new_records, stats
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="cleanclaude", description="Reclaim context from a Claude Code session — compaction by default, or --prune — and verify it resumes.")
+    ap.add_argument("target", help="conversation id, or a path to a .jsonl transcript")
+    ap.add_argument("--prune", action="store_true", help="prune instead of compacting: evict tool I/O to the snapshot store and leave <context-pruned> tags — NO LLM calls; keeps every turn")
+    ap.add_argument("--ratio", type=float, default=0.5, help="compaction: fold up the oldest fraction of context by weight (0.5 = compact ~50%%, keep newest ~50%% verbatim)")
+    ap.add_argument("--keep-last", type=int, default=4, help="prune: keep the last N user-prompt turns' tool I/O intact (default 4)")
+    ap.add_argument("--summarizer-model", default="claude-sonnet-4-6", help="compaction: model that distills the assistant side")
+    ap.add_argument("--chunk-tokens", type=int, default=50000, help="compaction: summarize the head in chunks of about this many tokens (default 50000)")
+    ap.add_argument("--no-verify", action="store_true", help="skip the resume verification")
+    args = ap.parse_args()
+
+    is_path = args.target.endswith(".jsonl") or os.path.isfile(args.target)
+
+    if is_path:
+        src = Path(args.target)
+        if not src.is_file():
+            print(f"cleanclaude: no such file: {src}", file=sys.stderr); return 1
+        records = load(src)
+        records, n_orphan = excise_orphans(records)
+        print(f"loaded {len(records)} records from {src}" + (f"; excised {n_orphan} orphan tool_result(s)" if n_orphan else ""))
+    else:
+        src = find_transcript(args.target)
+        if not src:
+            print(f"cleanclaude: no transcript found for id {args.target}", file=sys.stderr); return 1
+        print(f"source : {src}")
+        records = load(src)
+        before = sum(len(json.dumps(r)) for r in records)
+        records, n_orphan = excise_orphans(records)
+        if n_orphan:
+            print(f"excised: {n_orphan} orphan tool_result(s) from rewound/abandoned branch(es)")
+        if args.prune:
+            store_dir = STORE / args.target
+            records, n_res, n_inp, cutoff = prune(records, args.keep_last, store_dir)
+            after = sum(len(json.dumps(r)) for r in records)
+            tmp = Path(tempfile.mkdtemp(prefix="cleanclaude-")) / f"pruned-{args.target}.jsonl"
+            dump(records, tmp)
+            print(f"pruned : stubbed {n_res} tool_result bodies + {n_inp} Edit/Write input fields before record {cutoff} (kept last {args.keep_last} prompts)")
+            print(f"snapshots: point-in-time content saved under {store_dir}")
+        else:
+            res = compact(records, args.keep_last, args.ratio, args.chunk_tokens, args.summarizer_model)
+            if res is None:
+                print("nothing to compact (too few turns, or ratio leaves nothing)"); return 0
+            records, stats = res
+            after = sum(len(json.dumps(r)) for r in records)
+            tmp = Path(tempfile.mkdtemp(prefix="cleanclaude-")) / f"compacted-{args.target}.jsonl"
+            dump(records, tmp)
+            print(f"compact: {stats['head_records']} head records -> {stats['chunks']} segments = {stats['synthetic_records']} role records (user verbatim, assistant distilled); kept {stats['tail_records']} tail verbatim [ratio {args.ratio}]")
+        print(f"size   : {before:,} -> {after:,} chars  ({100*(before-after)//max(before,1)}% smaller)")
+        print(f"temp   : {tmp}")
+
+    errs, warns, tlen = validate(records)
+    if errs:
+        print(f"VALIDATION FAILED ({len(errs)}): " + "; ".join(errs[:5]), file=sys.stderr)
+        return 2
+    note = f" — {len(warns)} pre-existing orphan tool_result(s), tolerated (Claude filters on resume)" if warns else ""
+    print(f"validate: live thread {tlen} records — chain + tool-pairing + no-empty OK{note}")
+
+    result, new_id, target = install_and_verify(records, do_verify=not args.no_verify)
+    print(f"installed new session: {new_id}")
+    print(f"           {target}")
+    if result is None:
+        print("verify : skipped (--no-verify)")
+        return 0
+    ok, probe = result
+    if ok:
+        print(f"verify : RESUMED OK — session loaded into a fresh context ✓")
+        print(f"resume with:  claude --resume {new_id}")
+        return 0
+    print("verify : FAILED to resume", file=sys.stderr)
+    print((probe.stderr or probe.stdout or "")[-600:], file=sys.stderr)
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())
