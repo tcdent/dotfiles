@@ -803,15 +803,18 @@ def reset_usage(records: list) -> int:
 
 
 def install_and_verify(records: list, do_verify: bool):
-    """Write records as a NEW session in the project dir matching their cwd,
-    then resume it headlessly without persisting the probe turn."""
-    cwd = next((r.get("cwd") for r in records if r.get("cwd")), str(Path.home()))
-    launch_cwd = cwd if os.path.isdir(cwd) else str(Path.home())
+    """Write records as a NEW session under the CURRENT working directory (where cleanclaude was
+    invoked) — NOT the source session's original cwd — and resume it headlessly without persisting
+    the probe turn. `claude --resume` is cwd-scoped (it looks only in the project dir for the cwd it
+    runs from), so installing under the caller's cwd means the clone resumes from where YOU are,
+    instead of some deep directory the original agent happened to be working in. Every record's cwd
+    is restamped to match."""
+    launch_cwd = os.getcwd()
     new_id = str(uuid.uuid4())
     for r in records:
         if "sessionId" in r:
             r["sessionId"] = new_id
-        if launch_cwd != cwd and "cwd" in r:
+        if "cwd" in r:
             r["cwd"] = launch_cwd
     proj = PROJECTS / sanitize_cwd(launch_cwd)
     proj.mkdir(parents=True, exist_ok=True)
@@ -1060,7 +1063,7 @@ def main() -> int:
     ok, probe = result
     if ok:
         print(f"verify : RESUMED OK — session loaded into a fresh context ✓")
-        print(f"resume with:  claude --resume {new_id}")
+        print(f"resume (from {os.getcwd()}):  claude --resume {new_id}")
         return 0
     print("verify : FAILED to resume", file=sys.stderr)
     print((probe.stderr or probe.stdout or "")[-600:], file=sys.stderr)
