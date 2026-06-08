@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""tinyclaude — launch a small, focused Claude Code "persona" instance.
+
+Personas live as Markdown-with-frontmatter profiles in:
+
+    ~/.config/tinyclaude/profiles/<name>.md
+
+Each profile separates the three concerns we want to compose independently:
+
+    ---
+    focus: "<one short line re-injected every turn>"   # the pre-user-message hook
+    classifier: |                                        # the classifier role prompt
+      <prose rules the auto-mode classifier reads to keep tool use in-role,
+       including the exact message it must emit when it blocks>
+    tools: [Read, Grep, Glob, Bash]                      # optional built-in tool allowlist
+    ---
+
+    <the markdown body — used verbatim as the system-prompt append (who the agent is)>
+
+How each maps onto verified Claude Code mechanics:
+  * body        -> --append-system-prompt            (role identity)
+  * focus       -> a UserPromptSubmit command hook    (compaction-proof per-turn nudge)
+  * classifier  -> autoMode.hard_deny prose + --permission-mode auto
+                   (semantic in-lane enforcement with a custom block message)
+  * tools       -> --tools                            (hard tool-surface restriction)
+
+tinyclaude does not strip anything — MCP servers, skills, and project memory all stay on
+(stripping is dumbclaude's job). It only layers the profile's pieces onto an otherwise
+normal Claude session. Note: a profile that sets `tools` restricts to a hard allowlist, so
+include `Skill` in that list to keep skill access. Everything is per-launch flags; nothing
+here mutates global config.
+
+Usage:
+  tinyclaude --list
+  tinyclaude <profile> [extra claude args...]      # e.g. tinyclaude reviewer
+  tinyclaude <profile> --resume <name>             # passthrough works as-is
+  tinyclaude <profile> -p "one-shot prompt"
+  tinyclaude --dry-run <profile> [args...]         # print the claude argv, don't launch
+
+Caveats worth remembering:
+  * The classifier role-fence is a *reasoning* judgment: it reliably blocks consequential
+    off-role actions, but won't necessarily wall off trivially benign no-ops. For a hard
+    wall, narrow `tools` (a tool you don't grant can't be used) or add a PreToolUse hook.
+  * --permission-mode auto activates the classifier; only added when a profile defines a
+    `classifier`.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+PROFILES_DIR = Path.home() / ".config" / "tinyclaude" / "profiles"
+
+_KEY = re.compile(r"^([A-Za-z_][\w-]*):\s?(.*)$")
+
+
+def _unquote(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
+
+
+def parse_frontmatter(fm: str) -> dict:
+    """Minimal YAML-subset parser: scalars, `[a, b]` inline lists, `|` block scalars,
+    and `- item` dash lists. Enough for focus/classifier/tools; no external dependency."""
+    data: dict = {}
+    lines = fm.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        m = _KEY.match(line)
+        if not m:
+            i += 1
+            continue
+        key, rest = m.group(1), m.group(2)
+        rs = rest.strip()
+        if rs in ("|", "|-"):                      # block scalar
+            i += 1
+            block = []
+            while i < len(lines) and (not lines[i].strip() or lines[i][:1].isspace()):
+                block.append(lines[i])
+                i += 1
+            indents = [len(b) - len(b.lstrip()) for b in block if b.strip()]
+            ind = min(indents) if indents else 0
+            data[key] = "\n".join(b[ind:] for b in block).strip("\n")
+        elif rs.startswith("[") and rs.endswith("]"):   # inline list
+            data[key] = [_unquote(x) for x in rs[1:-1].split(",") if x.strip()]
+            i += 1
+        elif rs == "":                              # dash list (or empty)
+            i += 1
+            items = []
+            while i < len(lines) and (not lines[i].strip() or lines[i][:1].isspace()):
+                s = lines[i].strip()
+                if s.startswith("- "):
+                    items.append(_unquote(s[2:]))
+                i += 1
+            data[key] = items
+        else:                                       # scalar
+            data[key] = _unquote(rs)
+            i += 1
+    return data
+
+
+def split_frontmatter(text: str) -> tuple[dict, str]:
+    text = text.lstrip("﻿")
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}, text.strip()
+    end = next((idx for idx in range(1, len(lines)) if lines[idx].strip() == "---"), None)
+    if end is None:
+        return {}, text.strip()
+    fm = "\n".join(lines[1:end])
+    body = "\n".join(lines[end + 1:]).strip()
+    return parse_frontmatter(fm), body
+
+
+@dataclass
+class Profile:
+    name: str
+    role: str                                       # system-prompt append (body)
+    focus: str = ""                                 # per-turn reminder
+    classifier: list[str] = field(default_factory=list)  # autoMode.hard_deny prose
+    tools: list[str] | None = None                  # built-in tool allowlist
+    model: str | None = None                        # --model (e.g. claude-sonnet-4-6)
+    compact_window: int | None = None               # autoCompactWindow: compaction threshold in tokens
+
+
+def load_profile(name: str) -> Profile:
+    path = PROFILES_DIR / f"{name}.md"
+    fm, body = split_frontmatter(path.read_text(encoding="utf-8"))
+    classifier = fm.get("classifier", [])
+    if isinstance(classifier, str):
+        classifier = [classifier] if classifier.strip() else []
+    cw = fm.get("compact_window")
+    return Profile(
+        name=name,
+        role=body,
+        focus=fm.get("focus", "") if isinstance(fm.get("focus"), str) else "",
+        classifier=classifier,
+        tools=fm.get("tools") or None,
+        model=fm.get("model") or None,
+        compact_window=int(cw) if isinstance(cw, str) and cw.strip().isdigit() else None,
+    )
+
+
+def list_profiles() -> list[str]:
+    return sorted(p.stem for p in PROFILES_DIR.glob("*.md"))
+
+
+def build_settings(p: Profile) -> dict:
+    settings: dict = {}
+    if p.focus:
+        # shlex.quote handles shell escaping; json.dumps (later) handles JSON escaping.
+        focus_cmd = "printf '%s\\n' " + shlex.quote(p.focus)
+        settings["hooks"] = {
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": focus_cmd}]}],
+        }
+    if p.classifier:
+        settings["autoMode"] = {"hard_deny": ["$defaults", *p.classifier]}
+    if p.compact_window:
+        settings["autoCompactWindow"] = p.compact_window
+    return settings
+
+
+def build_argv(p: Profile, passthrough: list[str]) -> list[str]:
+    argv = ["claude"]
+    if p.model:
+        argv += ["--model", p.model]
+    if p.classifier:
+        argv += ["--permission-mode", "auto"]
+    if p.role:
+        argv += ["--append-system-prompt", p.role]
+    if p.tools:
+        argv += ["--tools", ",".join(p.tools)]
+    argv += ["--settings", json.dumps(build_settings(p), separators=(",", ":"))]
+    argv += passthrough
+    return argv
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="tinyclaude",
+        description="Launch a small, focused Claude Code persona from a profile.",
+    )
+    parser.add_argument("--list", action="store_true", help="list available profiles and exit")
+    parser.add_argument("--dry-run", action="store_true", help="print the claude argv instead of launching")
+    parser.add_argument("profile", nargs="?", help="profile name (see --list)")
+    parser.add_argument("claude_args", nargs=argparse.REMAINDER, help="args passed straight to claude")
+    args = parser.parse_args()
+
+    available = list_profiles()
+
+    if args.list or not args.profile:
+        print(f"Profiles in {PROFILES_DIR}:")
+        for name in available:
+            p = load_profile(name)
+            tools = ",".join(p.tools) if p.tools else "default"
+            print(f"  {name:12s} tools={tools}")
+            if p.focus:
+                print(f"               {p.focus}")
+        return 0 if args.list else 2
+
+    if args.profile not in available:
+        print(f"tinyclaude: unknown profile '{args.profile}' (try --list)", file=sys.stderr)
+        return 2
+
+    argv = build_argv(load_profile(args.profile), args.claude_args)
+    if args.dry_run:
+        print(shlex.join(argv))
+        return 0
+
+    os.execvp("claude", argv)   # replace this process with claude
+
+
+if __name__ == "__main__":
+    sys.exit(main())
