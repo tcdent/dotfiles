@@ -35,7 +35,7 @@ QUICKSTART
   cleanclaude <session-id> --prune
 
   # The exact command that created the 75%-reclaimed clone writing this docstring:
-  cleanclaude fa7fe4db-4440-4bf9-b371-178fbdd5ee04 --ratio 0.75 --no-verify
+  cleanclaude fa7fe4db-4440-4bf9-b371-178fbdd5ee04 --ratio 0.75
   claude --resume <new-id>        # then resume the clone it prints (here: into tmux pane slomp:2.4)
 
   # Operate on a raw transcript path instead of an id (this is also the install/verify path):
@@ -55,7 +55,7 @@ QUICKSTART
   `agent-message lookup <identity>`) resolves it.
 
   Flags: --ratio R (compaction: fold oldest R by weight; default 0.5) · --prune (no-LLM eviction) ·
-  --keep-last N (prune: keep last N turns' tool I/O; default 4) · --chunk-tokens K · --no-verify.
+  --keep-last N (prune: keep last N turns' tool I/O; default 4) · --groups N (default 10) · --drop K (default 1) · --live-verify.
 
 
 ================================================================================
@@ -117,14 +117,17 @@ Flags:
                      weight into summary turns (default 0.5; newest 1-R kept verbatim)
   --prune            no-LLM eviction mode instead of compaction
   --keep-last N      prune: keep the last N user-prompt turns' tool I/O intact (default 4)
-  --chunk-tokens K   compaction: summarize the head in ~K-token chunks (default 50000)
+  --groups N         compaction: compress the head into N proportional groups (default 10)
+  --drop K           compaction: roll off the oldest K groups entirely (default 1)
   --summarizer-model compaction: model that distills the assistant side
-  --no-verify        skip the resume verification
+  --live-verify      after install, resume the clone with a model turn to confirm it loads (OFF by default; costs tokens)
 
-Every run ends by ACTUALLY RESUMING the product (headless `-p`, with
-`--no-session-persistence` so the probe turn doesn't pollute the clean session).
-A transcript that validates statically but won't resume is a failure; the resume
-is the real gate.
+By default a run ends after static validation + install — those structural checks
+are the gate. Pass `--live-verify` to ALSO resume the product headlessly and
+confirm it loads; it is OFF by default because that probe turn costs tokens warming
+a prompt cache the agent's real first turn won't reuse (different first message /
+cache TTL). When used, it runs with `--no-session-persistence` so the probe doesn't
+pollute the clean session.
 
 
 ================================================================================
@@ -325,12 +328,15 @@ and (c) preserves the human's voice. Steps:
     user turn. `--ratio` is the single knob worth tuning: 0.25 ≈ imperceptible,
     0.5 ≈ works well, 0.75 ≈ starts to get shaky (to be characterized).
 
-  STEP 2 — CHUNK the head into ~`--chunk-tokens` segments at turn boundaries.
-    WHY: a one-shot summary of a huge head is dicey. We learned this the hard
-    way twice — a 235K-char head as a single `-p` ARGUMENT blew ARG_MAX
-    ("Argument list too long"), which is why the summarizer now PIPES the head
-    over STDIN; and big single summaries are lower quality / higher risk than a
-    few focused ones. Chunking makes it robust and parallelizable.
+  STEP 2 — GROUP the head into `--groups` PROPORTIONAL groups (fixed count, roughly
+    equal weight, at turn boundaries), then ROLL OFF the oldest `--drop` groups.
+    WHY fixed-count proportional (not fixed-token chunks): across REPEATED compaction
+    a fixed-token chunker funnels the never-compressed verbatim user content into one
+    ballooning node; a fixed number of proportional groups instead yields a stable
+    AGE GRADIENT (oldest groups march downward), and `--drop` rolls the oldest off so
+    total growth stays bounded. WHY group at all: one-shot summarizing a huge head is
+    dicey — a 235K-char head as a single `-p` ARGUMENT blew ARG_MAX, so the summarizer
+    PIPES over STDIN, and a few focused summaries beat one big one.
 
   STEP 3 — DUAL-VOICE summarize each chunk, asymmetrically by role:
     * USER turns  -> KEPT VERBATIM. Concatenated as-is into a synthetic `user`
@@ -340,7 +346,7 @@ and (c) preserves the human's voice. Steps:
                      what it did/decided. Synthetic `assistant` record.
 
   STEP 4 — REBUILD as REAL alternating user/assistant records (not a prose blob),
-    fresh uuids, chained; splice: scaffolding + [user, assistant] x chunks + tail;
+    fresh uuids, chained; splice: scaffolding + [user, assistant] x groups + tail;
     re-link the first tail record to the last synthetic record.
 
   STEP 5 — validate, install, resume-verify (with the 1M model, because a large
@@ -878,10 +884,11 @@ def summarize(head_text: str, model: str) -> str:
     return (p.stdout or "").strip()
 
 
-def chunk_head(head: list, chunk_tokens: int) -> list:
-    """Split the head into ~chunk_tokens chunks, breaking only at turn boundaries
-    (a turn starts at each genuine user prompt) so each chunk is coherent."""
-    budget = max(chunk_tokens, 1000) * CHARS_PER_TOKEN
+def group_head(head: list, n_groups: int) -> list:
+    """Split the head into ~n_groups PROPORTIONAL groups of roughly equal weight, breaking only at
+    turn boundaries (a turn starts at each genuine user prompt). Unlike cleanclaude's fixed-token
+    chunks, the group COUNT is fixed — so repeated compaction yields a stable AGE GRADIENT (oldest
+    groups march downward and can be rolled off) instead of one ever-growing node."""
     turns, cur = [], []
     for r in head:
         if is_user_prompt(r) and cur:
@@ -891,17 +898,23 @@ def chunk_head(head: list, chunk_tokens: int) -> list:
             cur.append(r)
     if cur:
         turns.append(cur)
-    chunks, c, c_chars = [], [], 0
+    n = max(n_groups, 1)
+    if len(turns) <= n:
+        return turns
+    total = sum(len(render_head(t)) for t in turns) or 1
+    budget = total / n
+    groups, c, c_chars = [], [], 0.0
     for turn in turns:
         tchars = len(render_head(turn))
-        if c and c_chars + tchars > budget:
-            chunks.append(c)
-            c, c_chars = [], 0
+        # close the current group once it's full, but never make more than n groups
+        if c and c_chars + tchars > budget and len(groups) < n - 1:
+            groups.append(c)
+            c, c_chars = [], 0.0
         c.extend(turn)
         c_chars += tchars
     if c:
-        chunks.append(c)
-    return chunks
+        groups.append(c)
+    return groups
 
 
 def _make_record(role: str, text: str, parent_uuid, template: dict) -> dict:
@@ -946,11 +959,13 @@ def distill_assistant(asst_text: str, model: str) -> str:
     return (p.stdout or "").strip() or "(assistant activity omitted)"
 
 
-def compact(records: list, keep_last: int, ratio, chunk_tokens: int, model: str):
-    """Partial compaction, role-structured + dual-voice. The head (oldest portion) is rebuilt
-    as real alternating user/assistant records: user turns kept VERBATIM (high-entropy signal,
-    cheap), assistant turns DISTILLED into the model's own voice per ~chunk_tokens segment. The
-    tail is kept verbatim. Split by --ratio of context weight (oldest fraction) else keep_last."""
+def compact(records: list, keep_last: int, ratio, n_groups: int, drop_oldest: int, model: str):
+    """Partial compaction, role-structured + dual-voice. The head (oldest portion) is rebuilt as
+    real alternating user/assistant records: user turns kept VERBATIM (high-entropy signal, cheap),
+    assistant turns DISTILLED into the model's own voice — but split into a FIXED n_groups of
+    proportional weight (an age gradient), and the oldest `drop_oldest` of those groups are ROLLED
+    OFF entirely (bounds growth across repeated compaction). The tail is kept verbatim. Split by
+    --ratio of context weight (oldest fraction) else keep_last."""
     thread = thread_records(records)
     prompts = [i for i, r in enumerate(thread) if is_user_prompt(r)]
     if len(prompts) < 2:
@@ -977,10 +992,12 @@ def compact(records: list, keep_last: int, ratio, chunk_tokens: int, model: str)
     if not head or not tail:
         return None
     template = next((r for r in tail if r.get("cwd")), tail[0])
-    chunks = chunk_head(head, chunk_tokens)
+    groups = group_head(head, n_groups)
+    n_dropped = min(max(drop_oldest, 0), len(groups))   # ROLL-OFF: drop the oldest groups entirely
+    groups = groups[n_dropped:]
     new_head = []
     prev = scaffolding[-1]["uuid"] if scaffolding else None
-    for i, ch in enumerate(chunks):
+    for i, ch in enumerate(groups):
         user_text, asst_text = split_chunk_voices(ch)
         distilled = distill_assistant(asst_text, model)
         if i == 0:
@@ -992,21 +1009,23 @@ def compact(records: list, keep_last: int, ratio, chunk_tokens: int, model: str)
         new_head += [u, a]
     tail[0]["parentUuid"] = prev
     new_records = scaffolding + new_head + tail
-    stats = {"chunks": len(chunks), "synthetic_records": len(new_head),
+    stats = {"groups": len(groups), "dropped": n_dropped, "synthetic_records": len(new_head),
              "head_records": len(head), "tail_records": len(tail)}
     return new_records, stats
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(prog="cleanclaude", description="Reclaim context from a Claude Code session — compaction by default, or --prune — and verify it resumes.")
+    ap = argparse.ArgumentParser(prog="cleanclaude", description="Reclaim context from a Claude Code session — compaction by default (the head folded into --groups proportional groups, the oldest --drop rolled off), or --prune — and verify it resumes.")
     ap.add_argument("target", help="conversation id, or a path to a .jsonl transcript")
     ap.add_argument("--prune", action="store_true", help="prune instead of compacting: evict tool I/O to the snapshot store and leave <context-pruned> tags — NO LLM calls; keeps every turn")
     ap.add_argument("--ratio", type=float, default=0.5, help="compaction: fold up the oldest fraction of context by weight (0.5 = compact ~50%%, keep newest ~50%% verbatim)")
     ap.add_argument("--keep-last", type=int, default=4, help="prune: keep the last N user-prompt turns' tool I/O intact (default 4)")
     ap.add_argument("--summarizer-model", default="claude-sonnet-4-6", help="compaction: model that distills the assistant side")
-    ap.add_argument("--chunk-tokens", type=int, default=50000, help="compaction: summarize the head in chunks of about this many tokens (default 50000)")
-    ap.add_argument("--no-verify", action="store_true", help="skip the resume verification")
+    ap.add_argument("--groups", type=int, default=10, help="compaction: compress the head into this many PROPORTIONAL groups (a fixed age-gradient), instead of fixed-token chunks (default 10)")
+    ap.add_argument("--drop", type=int, default=1, help="compaction: ROLL OFF the oldest N groups entirely (bounds growth across repeated compaction; default 1). Pass 0 to keep all groups.")
+    ap.add_argument("--live-verify", action="store_true", help="after install, actually resume the clone with a model turn to confirm it loads (OFF by default — it costs tokens warming a prompt cache the real first turn won't reuse; static validation already gates structure)")
     args = ap.parse_args()
+    sys.stdout = sys.stderr   # human progress -> stderr; ONLY the new session id goes to real stdout, so:  id=$(cleanclaude ...)
 
     is_path = args.target.endswith(".jsonl") or os.path.isfile(args.target)
 
@@ -1036,14 +1055,14 @@ def main() -> int:
             print(f"pruned : stubbed {n_res} tool_result bodies + {n_inp} Edit/Write input fields before record {cutoff} (kept last {args.keep_last} prompts)")
             print(f"snapshots: point-in-time content saved under {store_dir}")
         else:
-            res = compact(records, args.keep_last, args.ratio, args.chunk_tokens, args.summarizer_model)
+            res = compact(records, args.keep_last, args.ratio, args.groups, args.drop, args.summarizer_model)
             if res is None:
                 print("nothing to compact (too few turns, or ratio leaves nothing)"); return 0
             records, stats = res
             after = sum(len(json.dumps(r)) for r in records)
             tmp = Path(tempfile.mkdtemp(prefix="cleanclaude-")) / f"compacted-{args.target}.jsonl"
             dump(records, tmp)
-            print(f"compact: {stats['head_records']} head records -> {stats['chunks']} segments = {stats['synthetic_records']} role records (user verbatim, assistant distilled); kept {stats['tail_records']} tail verbatim [ratio {args.ratio}]")
+            print(f"compact: {stats['head_records']} head records -> {stats['groups']} groups (rolled off {stats['dropped']} oldest) = {stats['synthetic_records']} role records; kept {stats['tail_records']} tail verbatim [ratio {args.ratio}, groups {args.groups}, drop {args.drop}]")
         print(f"size   : {before:,} -> {after:,} chars  ({100*(before-after)//max(before,1)}% smaller)")
         print(f"temp   : {tmp}")
 
@@ -1054,20 +1073,19 @@ def main() -> int:
     note = f" — {len(warns)} pre-existing orphan tool_result(s), tolerated (Claude filters on resume)" if warns else ""
     print(f"validate: live thread {tlen} records — chain + tool-pairing + no-empty OK{note}")
 
-    result, new_id, target = install_and_verify(records, do_verify=not args.no_verify)
+    result, new_id, target = install_and_verify(records, do_verify=args.live_verify)
     print(f"installed new session: {new_id}")
     print(f"           {target}")
-    if result is None:
-        print("verify : skipped (--no-verify)")
-        return 0
-    ok, probe = result
-    if ok:
-        print(f"verify : RESUMED OK — session loaded into a fresh context ✓")
-        print(f"resume (from {os.getcwd()}):  claude --resume {new_id}")
-        return 0
-    print("verify : FAILED to resume", file=sys.stderr)
-    print((probe.stderr or probe.stdout or "")[-600:], file=sys.stderr)
-    return 3
+    if result is not None:                              # --live-verify ran a real resume
+        ok, probe = result
+        if not ok:
+            print("verify : FAILED to resume", file=sys.stderr)
+            print((probe.stderr or probe.stdout or "")[-600:], file=sys.stderr)
+            return 3
+        print("verify : RESUMED OK — session loaded into a fresh context ✓")
+    print(f"resume (from {os.getcwd()}):  claude --resume {new_id}")
+    print(new_id, file=sys.__stdout__)   # the one machine-readable line, for: id=$(cleanclaude ...)
+    return 0
 
 
 if __name__ == "__main__":
