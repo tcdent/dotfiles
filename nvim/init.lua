@@ -6,6 +6,8 @@ require("markdown")
 require("neotree")
 
 -- Basic Settings
+
+vim.opt.termguicolors = true
 vim.opt.number = true              -- Show line numbers
 --vim.opt.relativenumber = true      -- Relative line numbers
 vim.opt.ignorecase = true          -- Ignore case in search
@@ -320,7 +322,9 @@ require("lazy").setup({
     "MeanderingProgrammer/render-markdown.nvim",
     dependencies = { "nvim-treesitter/nvim-treesitter", "nvim-tree/nvim-web-devicons" },
     config = function()
-      require("render-markdown").setup({})
+      require("render-markdown").setup({
+        code = { disable = {} },
+      })
     end,
   },
 
