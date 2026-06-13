@@ -2,6 +2,8 @@
 *
 
 # But track these directories
+!agent/
+!agent/**
 !bin/
 !bin/**
 !ghostty/
@@ -20,6 +22,8 @@
 !rustfmt/**
 !irssi/
 !irssi/**
+!tinyclaude/
+!tinyclaude/**
 
 # Ignore irssi credentials and logs
 irssi/startup
@@ -28,4 +32,7 @@ irssi/logs/
 # And these files
 !.gitignore
 !README.md
+
+# Re-ignore credentials inside otherwise-tracked dirs
 agent-tracker/secrets.env
+codey/auth.json
