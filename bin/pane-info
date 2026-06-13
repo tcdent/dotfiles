@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# pane-info: reliably determine agent identity and runner type in a tmux pane.
+# Usage: pane-info [target-pane]
+# target-pane can be %id, session:window.pane, or omitted for current.
+#
+# Output (one per line, easy to source or parse):
+#   identity=foo.bar@a10k.internal
+#   runner=grok|codex|claude|channel|shell|other
+#   cmd=grok
+#   title=...
+#   pane=slomp:2.8
+#
+# Logic based on the agent-message conventions + process inspection.
+
+set -euo pipefail
+
+target="${1:-$(tmux display-message -p '#{pane_id}')}"
+
+title=$(tmux display-message -p -t "$target" '#{pane_title}' 2>/dev/null || echo "")
+cmd=$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || echo "")
+pane_addr=$(tmux display-message -p -t "$target" '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || echo "$target")
+
+# Extract identity using the exact same regex as agent-message
+identity=$(echo "$title" | grep -oE '[a-zA-Z0-9._-]+@a10k\.internal' | head -1 || true)
+
+runner="$cmd"
+
+if [[ "$title" == \#* ]]; then
+  runner="channel"
+elif [[ "$cmd" == "bash" ]]; then
+  # Peek at the direct child process for more accuracy (the shell's child is usually the agent)
+  pane_pid=$(tmux display-message -p -t "$target" '#{pane_pid}' 2>/dev/null || true)
+  if [[ -n "$pane_pid" ]]; then
+    child=$(pgrep -P "$pane_pid" | head -1 || true)
+    if [[ -n "$child" ]]; then
+      child_comm=$(ps -p "$child" -o comm= 2>/dev/null || true)
+      child_args=$(ps -p "$child" -o args= 2>/dev/null || true)
+      if [[ "$child_comm" =~ ^(grok|codex|claude)$ ]]; then
+        runner="$child_comm"
+      elif [[ "$child_args" == *"agent-channel"* ]]; then
+        runner="channel"
+      else
+        runner="bash (child: ${child_comm:-unknown})"
+      fi
+    fi
+  fi
+fi
+
+# Fallbacks
+if [[ -z "$identity" && "$title" == *"@a10k.internal"* ]]; then
+  identity=$(echo "$title" | grep -oE '[a-zA-Z0-9._-]+@a10k\.internal' | head -1 || true)
+fi
+
+if [[ -z "$runner" ]]; then
+  runner="unknown"
+fi
+
+echo "pane=$pane_addr"
+echo "identity=${identity:-none}"
+echo "runner=$runner"
+echo "cmd=$cmd"
+echo "title=$title"

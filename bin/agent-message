@@ -5,6 +5,7 @@
 #   agent-message whoami                           # print your identity
 #   agent-message dir [workspace|global|network]   # list panes (default: workspace)
 #   agent-message send <target> <message>          # send a message to a peer
+#   agent-message lookup <identity>                # resolve identity -> Claude Code transcript UUID
 #
 # Targets may be agent identities (<id>@a10k.internal), tmux addresses
 # (session:window.pane), or the two@a10k.co alias. Cross-host routing is
@@ -72,13 +73,29 @@ load_hosts() {
 load_hosts
 
 get_self() {
-  [[ -z "${TMUX_PANE:-}" ]] && die "not running inside tmux"
-  tmux display-message -p -t "$TMUX_PANE" "#{session_name}:#{window_index}.#{pane_index}"
+  local target
+  target=$(current_tmux_target) || die "not running inside tmux"
+  tmux display-message -p -t "$target" "#{session_name}:#{window_index}.#{pane_index}"
 }
 
 get_session() {
-  [[ -z "${TMUX_PANE:-}" ]] && die "not running inside tmux"
-  tmux display-message -p -t "$TMUX_PANE" "#{session_name}"
+  local target
+  target=$(current_tmux_target) || die "not running inside tmux"
+  tmux display-message -p -t "$target" "#{session_name}"
+}
+
+current_tmux_target() {
+  if [[ -n "${AGENT_TMUX_PANE:-}" ]]; then
+    echo "$AGENT_TMUX_PANE"
+    return 0
+  fi
+
+  if [[ -n "${TMUX_PANE:-}" ]]; then
+    echo "$TMUX_PANE"
+    return 0
+  fi
+
+  return 1
 }
 
 # Forward lookup: identity (email) → tmux address
@@ -131,9 +148,18 @@ reverse_identity() {
 # Prefer the sender's identity for attribution; fall back to tmux address if
 # the pane isn't tagged with an identity.
 get_self_identity() {
-  [[ -z "${TMUX_PANE:-}" ]] && die "not running inside tmux"
   local id
-  id=$(reverse_identity "$TMUX_PANE")
+  if [[ -n "${AGENT_IDENTITY:-}" ]]; then
+    id=$(identity_from_title "$AGENT_IDENTITY")
+    if [[ -n "$id" ]]; then
+      echo "$id"
+      return 0
+    fi
+  fi
+
+  local target
+  target=$(current_tmux_target) || die "not running inside tmux"
+  id=$(reverse_identity "$target")
   if [[ -n "$id" ]]; then
     echo "$id"
   else
@@ -151,17 +177,14 @@ escape_message() {
     die "message contains escape sequences that cannot be safely sent"
   fi
 
-  # tmux send-keys with a quoted string handles most things fine.
-  # We need to escape:
-  #   - backslashes (double them)
-  #   - double quotes (backslash-escape)
-  #   - dollar signs (prevent shell expansion in recipient)
-  #   - backticks (prevent command substitution)
-  msg="${msg//\\/\\\\}"
-  msg="${msg//\"/\\\"}"
-  msg="${msg//\$/\\\$}"
-  msg="${msg//\`/\\\`}"
-
+  # No character escaping. `tmux send-keys -t X "$msg" Enter` passes the single
+  # shell-quoted arg through literally — backslash, $, ", `, and ; all land
+  # verbatim in the recipient (verified). The previous backslash-doubling +
+  # $/"/` escaping was NEVER undone by tmux, so messages arrived garbled
+  # (e.g. `back\slash` -> `back\\slash`). Recipients are AI input panes
+  # (claude/codex/grok), not shells, so there is nothing to neutralize.
+  # NOTE: if a target is ever a raw shell pane, the literal text would be
+  # typed and run on Enter — re-add recipient-aware escaping if that case returns.
   printf '%s' "$msg"
 }
 
@@ -239,12 +262,14 @@ cmd_dir() {
   # over SSH, there's no TMUX_PANE — leaving self empty disables the "(you)"
   # marker, which is correct from the remote caller's perspective).
   local self=""
-  [[ -n "${TMUX_PANE:-}" ]] && self=$(get_self)
+  local current_target
+  current_target=$(current_tmux_target 2>/dev/null || true)
+  [[ -n "${current_target:-}" ]] && self=$(get_self)
 
   local pane_list
   case "$scope" in
     workspace)
-      [[ -z "${TMUX_PANE:-}" ]] && die "workspace scope requires tmux context"
+      [[ -z "${current_target:-}" ]] && die "workspace scope requires tmux context"
       local session
       session=$(get_session)
       pane_list=$(tmux list-panes -s -t "$session" \
@@ -491,6 +516,14 @@ print(json.dumps({"from": os.environ["SELF"], "to": os.environ["TARGET"], "body"
     fi
   fi
 
+  # Determine target runner type using the same logic as pane-info / agent dir.
+  # This lets us use separate straightforward branches for each target's
+  # enter protocol (no shared send_key variable).
+  local target_cmd=""
+  if [[ "$target" =~ ^[^@]+:[0-9]+\.[0-9]+$ ]]; then
+    target_cmd=$(tmux display-message -p -t "$target" '#{pane_current_command}' 2>/dev/null || echo "")
+  fi
+
   # Build the payload: --raw passes through, normal path prepends a
   # [self->target] envelope.
   local payload
@@ -505,14 +538,63 @@ print(json.dumps({"from": os.environ["SELF"], "to": os.environ["TARGET"], "body"
   local escaped
   escaped=$(escape_message "$payload")
 
-  tmux send-keys -t "$target" "$escaped" Enter
+  if [[ "$target_cmd" == "grok" ]]; then
+    # Grok: always use C-Enter for interject behavior (injects into current turn)
+    tmux send-keys -t "$target" "$escaped" Enter
 
-  # Brief pause to let tmux process the message before the safety enter.
-  # Without this, the trailing enter can arrive before the message is fully
-  # rendered in the target pane, causing submission to fail on long messages.
-  sleep 0.2
+    # Brief pause to let tmux process the message before trying C-Enter to inject
+    # the message mid-turn.
+    sleep 3
+    tmux send-keys -t "$target" "" C-Enter
 
-  tmux send-keys -t "$target" "" Enter
+    # We also try regular enter in case control+Enter was not available due to the agent being idle.
+    sleep 3
+    tmux send-keys -t "$target" "" Enter
+  elif [[ "$target_cmd" == "codex" ]]; then
+    tmux send-keys -t "$target" "$escaped" Enter
+
+    # Brief pause...
+    sleep 1
+    tmux send-keys -t "$target" "" Enter
+
+    # codex needs extra enters sometimes?
+    # we disabled the codex paste matcher, which is supposed to make this easier
+    # the first sleep handles codex's latency on large pastes since they don't buffer adequately
+    # the subsequent enters push the cursor down long messages until eventually it submits
+    sleep 6
+    tmux send-keys -t "$target" "" Enter
+    sleep 0.1
+    tmux send-keys -t "$target" "" Enter
+    sleep 0.1
+    tmux send-keys -t "$target" "" Enter
+    sleep 0.1
+    tmux send-keys -t "$target" "" Enter
+  else
+    # Default (claude and others): normal Enter
+    tmux send-keys -t "$target" "$escaped" Enter
+
+    # Brief pause to let tmux process the message before the safety enter.
+    sleep 1
+    tmux send-keys -t "$target" "" Enter
+  fi
+}
+
+# Resolve an agent identity to its Claude Code transcript UUID (session id), via the identity
+# STAMP inside the transcript (agentName / customTitle) — a structured field, not prose. Unlike the
+# live-pane chain (pane -> process -> cwd; see the get-history-filename skill), the stamp survives
+# the agent process being KILLED, which fits the "kill at 100%, then clean" workflow. Newest mtime
+# wins. Prints only the UUID, so:   cleanclaude "$(agent-message lookup <identity>)"
+cmd_lookup() {
+  local identity="${1:-}"
+  [[ -n "$identity" ]] || die "usage: agent-message lookup <identity>"
+  local projects="$HOME/.claude/projects"
+  [[ -d "$projects" ]] || die "no ~/.claude/projects on this host"
+  local newest
+  newest=$( for field in agentName customTitle; do
+              grep -rlF --include='*.jsonl' -- "\"${field}\":\"${identity}\"" "$projects" 2>/dev/null || true
+            done | sort -u | xargs -r ls -t 2>/dev/null | head -1 )
+  [[ -n "$newest" ]] || die "no local transcript stamped with identity '$identity' (remote agents are not resolved; for an unstamped/renamed session use the get-history-filename skill via its live pane)"
+  basename "$newest" .jsonl
 }
 
 # --- Main ---
@@ -521,12 +603,14 @@ case "${1:-}" in
   whoami) cmd_whoami ;;
   dir)    cmd_dir "${2:-workspace}" ;;
   send)   shift; cmd_send "$@" ;;
+  lookup) shift; cmd_lookup "$@" ;;
   -h|--help|help|"")
     cat <<EOF
 Usage:
   agent-message whoami                             Print your identity (or tmux address if untagged)
   agent-message dir [workspace|global|network]     List panes — identity shown when present, tmux address otherwise
   agent-message send <target> <message>            Send a message to a peer
+  agent-message lookup <identity>                  Resolve an identity to its Claude Code transcript UUID (feed to cleanclaude)
 
 Scopes:
   workspace  current tmux session only

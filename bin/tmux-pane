@@ -1,0 +1,29 @@
+#!/bin/bash
+
+usage() {
+  echo "Usage: tmux-pane <session>:<window>.<pane>"
+  echo ""
+  echo "Examples:" echo " tmux-pane foo:2.6"
+  echo " tmux-pane foo:0.1" exit 1
+}
+
+[ -z "$1" ] && usage TARGET="$1"
+
+SESSION="${TARGET%%:*}"
+WINDOW_PANE="${TARGET#*:}"
+WINDOW="${WINDOW_PANE%%.*}"
+PANE="${WINDOW_PANE#*.}"
+CLIENT_IP=$(echo "$SSH_CLIENT" | awk '{print $1}')
+NAME="${SESSION}_${CLIENT_IP}_$$"
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "Error: tmux session '$SESSION' not found."
+  tmux list-sessions 2>/dev/null
+  exit 1
+fi
+
+tmux new-session -t "$SESSION" -A -s "$NAME" \; \
+  set-option destroy-unattached \; \
+  select-window -t "$WINDOW" \; \
+  select-pane -t "$PANE" \; \
+  resize-pane -Z

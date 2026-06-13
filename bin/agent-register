@@ -238,16 +238,16 @@ EOF
 echo ""
 echo "  identity file: $IDENTITY_FILE"
 
-# If we're running inside a Claude Code session in tmux, claim this identity
-# for the current session by queuing /rename to our own pane. The keystrokes
-# land at Claude Code's input prompt when the current turn ends, triggering
-# the slash command. Propagates to the iOS app the same as a manual /rename.
-if [[ -n "${CLAUDECODE:-}" && -n "${TMUX_PANE:-}" ]]; then
+# If we're running inside a Claude Code or Codex session in tmux, claim this
+# identity for the current session by queuing /rename to our own pane. The
+# keystrokes land at the agent's input prompt when the current turn ends,
+# triggering the slash command.
+if [[ ( -n "${CLAUDECODE:-}" || -n "${CODEX_MANAGED_BY_NPM:-}" || -n "${CODEX_MANAGED_BY_BUN:-}" ) && -n "${TMUX_PANE:-}" ]]; then
   tmux send-keys -t "$TMUX_PANE" "/rename $EMAIL" Enter
   echo ""
-  echo "queued /rename to this Claude Code session — name will update when the current turn ends."
+  echo "queued /rename to this agent session — name will update when the current turn ends."
 else
   echo ""
-  echo "launch Claude Code with this identity:"
+  echo "launch your agent with this identity:"
   echo "  claude --name '$EMAIL'"
 fi

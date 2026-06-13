@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# tmux-top: live-refreshing top, but only for processes inside your tmux sessions
+#
+# Usage:
+#   ./tmux-top              # all tmux processes
+#   ./tmux-top grep nginx   # filter by process name
+#   ./tmux-top session dev  # only a specific tmux session
+#   INTERVAL=3 ./tmux-top   # custom refresh interval (default: 2s)
+#
+# Requires: tmux, ps, pgrep
+
+set -euo pipefail
+
+FILTER=""
+SESSION_FILTER=""
+INTERVAL="${INTERVAL:-2}"
+
+# --- Parse args ---
+case "${1:-}" in
+  grep)    FILTER="${2:-}" ;;
+  session) SESSION_FILTER="${2:-}" ;;
+  -h|--help)
+    echo "Usage:"
+    echo "  tmux-top              # all tmux processes"
+    echo "  tmux-top grep <pat>   # filter by process name"
+    echo "  tmux-top session <s>  # only a specific tmux session"
+    echo "  INTERVAL=5 tmux-top   # set refresh rate (default 2s)"
+    exit 0
+    ;;
+  "") ;;
+  *)  FILTER="$1" ;;
+esac
+
+if ! command -v tmux &>/dev/null || ! tmux info &>/dev/null 2>&1; then
+  echo "No tmux server running." >&2
+  exit 1
+fi
+
+# --- Walk process tree to collect all descendants ---
+collect_descendants() {
+  local parent=$1
+  local children
+  children=$(pgrep -P "$parent" 2>/dev/null || true)
+  for child in $children; do
+    echo "$child"
+    collect_descendants "$child"
+  done
+}
+
+# --- Gather PIDs from tmux panes + their full process trees ---
+gather_pids() {
+  local pane_pids
+  if [[ -n "$SESSION_FILTER" ]]; then
+    pane_pids=$(tmux list-panes -s -t "$SESSION_FILTER" -F '#{pane_pid}' 2>/dev/null || true)
+  else
+    pane_pids=$(tmux list-panes -a -F '#{pane_pid}' 2>/dev/null || true)
+  fi
+
+  [[ -z "$pane_pids" ]] && return
+
+  local all_pids=""
+  for ppid in $pane_pids; do
+    all_pids+="$ppid"$'\n'
+    all_pids+="$(collect_descendants "$ppid")"$'\n'
+  done
+
+  all_pids=$(echo "$all_pids" | sort -un | grep -v '^$')
+
+  # Optional grep filter
+  if [[ -n "$FILTER" ]]; then
+    local filtered=""
+    for pid in $all_pids; do
+      local info
+      info=$(ps -p "$pid" -o comm=,args= 2>/dev/null || true)
+      if echo "$info" | grep -qi "$FILTER"; then
+        filtered+="$pid"$'\n'
+      fi
+    done
+    all_pids=$(echo "$filtered" | grep -v '^$')
+  fi
+
+  echo "$all_pids"
+}
+
+# --- Render one frame ---
+render() {
+  local pids="$1"
+  local now
+  now=$(date '+%H:%M:%S')
+
+  local count
+  count=$(echo "$pids" | wc -l)
+
+  local header="tmux-top | $count process(es) | every ${INTERVAL}s | $now"
+  [[ -n "$FILTER" ]] && header+=" | filter: $FILTER"
+  [[ -n "$SESSION_FILTER" ]] && header+=" | session: $SESSION_FILTER"
+  header+="  [q to quit]"
+
+  # Column header + process rows, sorted by CPU desc
+  local table
+  table=$(ps -p "$(echo "$pids" | paste -sd, -)" \
+    -o pid,user,%cpu,%mem,vsz,rss,stat,start,time,args \
+    --sort=-%cpu 2>/dev/null || true)
+
+  printf '\033[2J\033[H'
+  printf '\033[1;36m%s\033[0m\n\n' "$header"
+  echo "$table"
+}
+
+# --- Main loop ---
+cleanup() { tput cnorm 2>/dev/null; exit 0; }
+trap cleanup INT TERM
+
+tput civis 2>/dev/null  # hide cursor
+
+while true; do
+  PIDS=$(gather_pids)
+
+  if [[ -z "$PIDS" ]]; then
+    printf '\033[2J\033[H'
+    echo "No matching tmux processes. Waiting... [q to quit]"
+  else
+    render "$PIDS"
+  fi
+
+  # Non-blocking read — 'q' quits, otherwise waits INTERVAL seconds
+  if read -rsn1 -t "$INTERVAL" key 2>/dev/null; then
+    [[ "$key" == "q" || "$key" == "Q" ]] && break
+  fi
+done
+
+tput cnorm 2>/dev/null
