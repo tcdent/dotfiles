@@ -27,11 +27,16 @@ Optionally install esh for debugging codey's system template (codey has it built
 curl -o ~/.local/bin/esh https://raw.githubusercontent.com/jirutka/esh/master/esh && chmod +x ~/.local/bin/esh
 ```
 
-Set up Claude Code symlinks:
+Set up agent symlinks. Claude Code and Codex read the **same** system prompt
+from `agent/SYSTEM.md` (one source of truth); Claude's settings are symlinked
+into `~/.claude/` as well:
 ```bash
-mkdir -p ~/.claude
+mkdir -p ~/.claude ~/.codex
+# shared system prompt → both tools
+ln -sf ~/.config/agent/SYSTEM.md ~/.claude/CLAUDE.md
+ln -sf ~/.config/agent/SYSTEM.md ~/.codex/AGENTS.md
+# Claude Code settings
 ln -sf ~/.config/claude/settings.json ~/.claude/settings.json
-ln -sf ~/.config/claude/CLAUDE.md ~/.claude/CLAUDE.md
 ```
 
 ## What's Here
@@ -42,7 +47,8 @@ ln -sf ~/.config/claude/CLAUDE.md ~/.claude/CLAUDE.md
   - `prefix + e` - stats workspace (btop, lazypodman, logs)
   - `prefix + : respawn-pane -k` - restart a pane
 - **ghostty/** - Terminal colors and settings, display switching (see [ghostty/README.md](ghostty/README.md))
-- **claude/** - Claude Code settings and instructions (symlinked to `~/.claude/`)
+- **agent/** - Shared agent system prompt (`SYSTEM.md`) + skills; symlinked into both `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`
+- **claude/** - Claude Code `settings.json` (symlinked to `~/.claude/settings.json`)
 - **bin/** - Helper scripts:
   - `nvims` - Open file in current nvim session
   - `nvimw` - Same but waits (for git commits)
