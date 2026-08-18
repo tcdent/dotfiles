@@ -17,10 +17,16 @@ export GIT_EDITOR='nvimw'
 
 Install dependencies:
 ```bash
-brew install neovim tmux neovim-remote ty lazydocker blueutil ruff
+brew install neovim tmux neovim-remote ty lazydocker blueutil ruff watchman
 rustup component add rust-analyzer
 rustup install nightly  # for rustfmt with group_imports
 ```
+
+`watchman` must come from brew. Debian ships 4.9.0 (2017) in every suite
+including sid and the package is orphaned; the upstream prebuilt Linux zip
+needs glibc 2.38 and bookworm has 2.36. Neovim's `filewatch` module treats a
+missing or dead daemon as a misconfigured system and reports it as an error
+rather than falling back — see [nvim/lua/filewatch.lua](nvim/lua/filewatch.lua).
 
 Optionally install esh for debugging codey's system template (codey has it built-in, but useful for testing). Use git version - brew is outdated:
 ```bash
@@ -41,7 +47,9 @@ ln -sf ~/.config/claude/settings.json ~/.claude/settings.json
 
 ## What's Here
 
-- **nvim/** - Neovim config with lazy.nvim, treesitter, LSP (Python, Rust), copilot, AI diagnostics
+- **nvim/** - Neovim config with lazy.nvim, treesitter, LSP (Python, Rust), AI diagnostics
+  - `lua/filewatch.lua` - watchman-backed file change events; the single source
+    of truth for buffer reloads, the file tree and the diff view
 - **tmux/** - tmux config with workspaces:
   - `prefix + w` - dev workspace (nvim + 4 shells)
   - `prefix + e` - stats workspace (btop, lazypodman, logs)

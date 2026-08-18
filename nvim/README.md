@@ -25,7 +25,7 @@ Leader key is `Space`.
 
 ### Git
 - `<leader>d` - Open diff view
-- `<leader>D` - Close diff view
+- `:Dq` - Close diff view
 
 ### LSP (Python, Rust)
 - `gd` - Go to definition
@@ -69,11 +69,6 @@ Leader key is `Space`.
 - `d` to delete, `y` to yank, `c` to change
 - `>` / `<` - Indent / dedent
 - `gc` - Toggle comment
-
-## First-Time Setup
-
-### GitHub Copilot
-Run `:Copilot setup` to authenticate with GitHub.
 
 ## Git Commits
 

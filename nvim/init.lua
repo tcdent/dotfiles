@@ -1,4 +1,5 @@
 local buffers = require("buffers")
+local filewatch = require("filewatch")
 require("hooks")
 require("python")
 require("rust")
@@ -101,16 +102,30 @@ vim.keymap.set('n', '<leader>fb', ':Telescope buffers<CR>', { desc = 'Browse buf
 
 -- Git
 vim.keymap.set('n', '<leader>d', ':DiffviewOpen<CR>', { desc = 'Git diff view' })
-vim.keymap.set('n', '<leader>D', ':DiffviewClose<CR>', { desc = 'Close diff view' })
 
 -- Git diff viewer
 -- :D              - unstaged changes (working tree diff)
 -- :D main...head  - diff branch against main (PR review)
 -- :D head~3       - last 3 commits
+-- :Dq             - close the diff view
 vim.api.nvim_create_user_command('D', function(opts)
   local args = opts.args:gsub('%f[%w]head%f[%W]', 'HEAD')
   vim.cmd('DiffviewOpen ' .. args)
 end, { nargs = '?' })
+
+vim.api.nvim_create_user_command('Dq', function()
+  vim.cmd('DiffviewClose')
+end, {})
+
+-- Diffview only watches .git/index itself (and that is disabled below), so the
+-- working tree comes from filewatch like everything else.
+filewatch.subscribe(launch_cwd, function()
+  local ok, lib = pcall(require, 'diffview.lib')
+  -- get_current_view() is already scoped to the focused tabpage
+  if ok and lib.get_current_view() then
+    pcall(vim.cmd, 'DiffviewRefresh')
+  end
+end)
 
 -- Diagnostics
 vim.keymap.set('n', '<leader>v', function()
@@ -126,14 +141,17 @@ vim.keymap.set('n', 'K', vim.lsp.buf.hover, { desc = 'Hover docs' })
 vim.keymap.set('n', '<leader>rn', vim.lsp.buf.rename, { desc = 'Rename symbol' })
 
 
--- Auto-reload files changed outside Neovim
-vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter", "CursorHold" }, {
-  callback = function()
-    local view = vim.fn.winsaveview()
-    vim.cmd("checktime")
-    vim.fn.winrestview(view)
-  end,
-})
+-- Auto-reload files changed outside Neovim.
+-- checktime is still what performs the reload -- it honours 'autoread' and the
+-- modified flag, works out which buffers are stale, and fires
+-- FileChangedShellPost below. Watchman only decides *when* to call it, so it no
+-- longer runs on idle. winsaveview/winrestview stay because reloading moves the
+-- viewport.
+filewatch.subscribe(launch_cwd, function()
+  local view = vim.fn.winsaveview()
+  vim.cmd('checktime')
+  vim.fn.winrestview(view)
+end)
 
 -- Refresh illuminate after file reloads
 vim.api.nvim_create_autocmd("FileChangedShellPost", {
@@ -303,11 +321,6 @@ require("lazy").setup({
   --   end,
   -- },
 
-  -- GitHub Copilot
-  {
-    "github/copilot.vim",
-  },
-
   -- Fuzzy finder
   {
     "nvim-telescope/telescope.nvim",
@@ -315,6 +328,15 @@ require("lazy").setup({
     config = function()
       require("telescope").setup({})
     end,
+  },
+
+  -- MDX: no treesitter grammar exists for MDX, so this sets the filetype and
+  -- injects markdown for prose + tsx for the embedded JSX.
+  -- No setup() to call: the plugin is just ftdetect + treesitter injection
+  -- queries under after/.
+  {
+    "davidmh/mdx.nvim",
+    dependencies = { "nvim-treesitter/nvim-treesitter" },
   },
 
   -- Markdown rendering in-editor
@@ -333,10 +355,18 @@ require("lazy").setup({
 
   -- Git diff viewer
   {
-    "sindrets/diffview.nvim",
+    -- Local fork (github.com/tcdent/diffview.nvim, branch preserve-fold-state):
+    -- upstream rebuilds the file tree on every refresh, which discards the
+    -- panel's collapsed directories. Not yet submitted upstream.
+    dir = "~/Work/diffview.nvim",
+    name = "diffview.nvim",
     dependencies = { "nvim-lua/plenary.nvim" },
     config = function()
-      require("diffview").setup({})
+      require("diffview").setup({
+        -- filewatch drives refreshes; diffview's own fs_poll on .git/index
+        -- would be a second watcher doing the same job.
+        watch_index = false,
+      })
     end,
   },
 

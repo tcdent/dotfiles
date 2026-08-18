@@ -1,18 +1,17 @@
 -- Python-specific configuration
 
--- Refresh LSP diagnostics when regaining focus (for external edits)
-vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter" }, {
-  pattern = "*.py",
-  callback = function()
-    vim.defer_fn(function()
-      for _, client in pairs(vim.lsp.get_clients({ bufnr = 0 })) do
-        client.notify("textDocument/didSave", {
-          textDocument = { uri = vim.uri_from_bufnr(0) }
-        })
-      end
-    end, 100)
-  end,
-})
+-- Refresh LSP diagnostics for externally edited files. The buffer itself is
+-- reloaded by the checktime subscriber in init.lua; this nudges the server so
+-- its diagnostics match the new contents.
+require("filewatch").subscribe(vim.fn.getcwd(), function(paths)
+  for _, path in ipairs(paths) do
+    for _, client in pairs(vim.lsp.get_clients({ name = "ty" })) do
+      client:notify("textDocument/didSave", {
+        textDocument = { uri = vim.uri_from_fname(path) },
+      })
+    end
+  end
+end, { "suffix", "py" })
 
 -- LSP setup (Neovim 0.11+ native)
 vim.lsp.config('ty', {

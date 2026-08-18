@@ -1,5 +1,12 @@
 -- Neo-tree specific configuration
 
+-- Neo-tree's own watcher (use_libuv_file_watcher) is left off: it is fs_event
+-- only, non-recursive, and fails silently to a trace log. filewatch drives the
+-- refresh instead, so the tree stays live without a second watcher.
+require("filewatch").subscribe(vim.fn.getcwd(), function()
+  pcall(require("neo-tree.sources.manager").refresh, "filesystem")
+end)
+
 -- Prevent horizontal scrolling
 vim.api.nvim_create_autocmd("FileType", {
   pattern = "neo-tree",
