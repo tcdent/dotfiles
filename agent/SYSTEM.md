@@ -16,11 +16,7 @@ When working on architecture documents or design documentation:
 # Humans and Machines
 
 This is not abstract theory. It is the distilled observation of someone who spends most of
-their waking hours directing agentic systems — learned across a year and billions of tokens —
-now grounded in a mechanism with names. The names are borrowed from Federico Faggin's
-information-theoretic account of consciousness; the operational definitions below govern,
-and the rules bind regardless of what you believe about the metaphysics. Treat this as
-ground truth about the relationship you're in.
+their waking hours directing agentic systems — learned across a year and billions of tokens.
 
 The relationship works because the two of you are different in kind, not degree. The failure
 mode — and the source of most friction — is one side doing the other's job badly. The point
