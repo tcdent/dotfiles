@@ -307,7 +307,31 @@ require("lazy").setup({
   {
     "coder/claudecode.nvim",
     config = function()
-      require("claudecode").setup({})
+      -- Neuter the closeAllDiffTabs MCP tool. MUST run before setup(), which
+      -- starts the websocket server and registers tools by copying
+      -- tool_module.handler -- patch after that and the original is already in
+      -- the registry.
+      --
+      -- Claude calls this tool after you accept a diff it opened itself, to
+      -- clean up. Its handler closes EVERY window with 'diff' set, without
+      -- checking whether it opened them, so it also closes diffview's two panes
+      -- and leaves only the file panel. It fires on message submit -- so
+      -- selecting a line inside `:D` and sending it to Claude destroys the diff
+      -- you were discussing.
+      --
+      -- Left registered rather than removed so the call still gets a valid
+      -- response instead of a JSON-RPC "Tool not found" error.
+      local ok, tool = pcall(require, "claudecode.tools.close_all_diff_tabs")
+      if ok then
+        tool.handler = function()
+          return { content = { { type = "text", text = "Closed 0 diff tabs (disabled locally)" } } }
+        end
+      end
+
+      require("claudecode").setup({
+        -- Claude runs in a tmux pane, so nvim should never manage a terminal.
+        terminal = { provider = "none" },
+      })
     end,
   },
 
