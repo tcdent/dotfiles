@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Call an agent.lua integration point in this tmux session's nvim.
+#
+#   agent-nvim status
+#   agent-nvim focus nvim/lua/agent.lua 34 34 48
+#   agent-nvim note nvim/init.lua 131 "this is the load-bearing line"
+#
+# Socket is derived the same way nvims does it, so this only works from inside
+# the tmux session that owns the nvim. Arguments that look like integers are
+# passed as numbers; everything else is quoted as a vimscript string, so no
+# quoting is needed at the call site.
+#
+# Functions live in ~/.config/nvim/lua/agent.lua. `agent-nvim status` is the
+# cheapest way to confirm the connection and see cwd, unsaved buffers and
+# windows before driving anything.
+
+if [[ -z "$1" || "$1" == -h || "$1" == --help ]]; then
+  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  echo
+  echo "available:"
+  grep -oP '^function M\.\K\w+' ~/.config/nvim/lua/agent.lua | sed 's/^/  /'
+  exit 0
+fi
+
+socket="/tmp/nvim-$(tmux display -p '#S' 2>/dev/null).sock"
+if [[ ! -S "$socket" ]]; then
+  echo "no nvim socket at $socket" >&2
+  exit 1
+fi
+
+fn=$1
+shift
+
+args=()
+for a in "$@"; do
+  if [[ $a =~ ^-?[0-9]+$ ]]; then
+    args+=("$a")
+  else
+    args+=("'${a//\'/\'\'}'") # vimscript escapes a single quote by doubling it
+  fi
+done
+
+printf -v joined '%s,' "${args[@]}"
+exec nvim --server "$socket" --remote-expr "v:lua.agent.${fn}(${joined%,})"

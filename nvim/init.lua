@@ -1,5 +1,6 @@
 local buffers = require("buffers")
 local filewatch = require("filewatch")
+require("agent") -- editor integration points for an agent on the socket
 require("hooks")
 require("python")
 require("rust")
