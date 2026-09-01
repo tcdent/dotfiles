@@ -65,6 +65,15 @@ end, { desc = 'New/empty buffer' })
 vim.keymap.set('n', '<leader>]', ':BufferLineCycleNext<CR>', { desc = 'Next buffer' })
 vim.keymap.set('n', '<leader>[', ':BufferLineCyclePrev<CR>', { desc = 'Previous buffer' })
 
+-- Navigate wrapped lines by screen line, so j/k step through a soft-wrapped
+-- paragraph instead of jumping the whole logical line. A count still means
+-- real lines (5j is five lines, not five screen rows), and with 'nowrap' gj/gk
+-- are identical to j/k, so this is inert in code buffers. Deliberately not
+-- mapped in operator-pending mode: gj is not linewise, which would change what
+-- dj and yj do.
+vim.keymap.set({ 'n', 'v' }, 'j', "v:count == 0 ? 'gj' : 'j'", { expr = true, desc = 'Down by screen line' })
+vim.keymap.set({ 'n', 'v' }, 'k', "v:count == 0 ? 'gk' : 'k'", { expr = true, desc = 'Up by screen line' })
+
 -- Keep selection after indent
 vim.keymap.set('v', '>', '>gv', { silent = true })
 vim.keymap.set('v', '<', '<gv', { silent = true })
