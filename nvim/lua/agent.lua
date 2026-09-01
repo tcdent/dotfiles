@@ -262,12 +262,40 @@ end
 
 ---Open the diff view. `rev` takes the same arguments as :D ("", "main...HEAD").
 ---Diffview opens its own tabpage, so the existing layout is left alone.
+---
+---Existing views are closed first. They accumulate across a session, and
+---reopening onto a stale one leaves it nulled: the panel shows nothing and
+---diff_files reports "no files" while git has plenty. Reporting the file count
+---here means the return value is not merely "the command did not error".
 function M.diff(rev)
-  local ok, e = pcall(vim.cmd, "DiffviewOpen " .. (rev or ""))
-  if not ok then
+  local ok, lib = pcall(require, "diffview.lib")
+  local closed = 0
+  if ok then
+    while #lib.views > 0 and closed < 20 do
+      closed = closed + 1
+      if not pcall(vim.cmd, "DiffviewClose") then
+        break
+      end
+    end
+  end
+
+  local opened, e = pcall(vim.cmd, "DiffviewOpen " .. (rev or ""))
+  if not opened then
     return "refused: " .. tostring(e)
   end
-  return "diff opened (tab " .. vim.fn.tabpagenr() .. ")"
+
+  -- The file list populates asynchronously, so wait briefly for it rather than
+  -- returning before the view is usable.
+  local view
+  vim.wait(3000, function()
+    view = ok and lib.get_current_view()
+    return view ~= nil and view.files ~= nil and view.files:len() > 0
+  end, 50)
+
+  local n = view and view.files and view.files:len() or 0
+  return string.format("diff opened (tab %d, %d files%s)%s", vim.fn.tabpagenr(), n,
+    closed > 0 and string.format(", closed %d stale", closed) or "",
+    n == 0 and " -- nothing to diff?" or "")
 end
 
 ---Show one file inside the open diff view, by its repo-relative path.
