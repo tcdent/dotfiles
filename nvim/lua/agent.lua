@@ -72,15 +72,17 @@ local function highlight(buf, first, last)
   end
 end
 
+---@return integer buf, integer lines, integer landed  -- landed may be clamped
 local function open_in(win, abs, line)
   vim.api.nvim_set_current_win(win)
   vim.cmd("edit " .. vim.fn.fnameescape(abs))
   local buf = vim.api.nvim_get_current_buf()
   vim.api.nvim_buf_clear_namespace(buf, NS_RANGE, 0, -1)
   local n = vim.api.nvim_buf_line_count(buf)
-  vim.api.nvim_win_set_cursor(win, { math.min(math.max(line or 1, 1), n), 0 })
+  local landed = math.min(math.max(line or 1, 1), n)
+  vim.api.nvim_win_set_cursor(win, { landed, 0 })
   vim.cmd("normal! zz")
-  return buf, n
+  return buf, n, landed
 end
 
 ---"path", "path:12", "path:12:20-40"
@@ -112,20 +114,27 @@ function M.focus(path, line, first, last)
   if not win then
     return "refused: no editable window"
   end
-  local buf, n = open_in(win, abs, line)
+  local buf, n, landed = open_in(win, abs, line)
   if first then
     highlight(buf, first, last or first)
   end
-  return string.format("%s:%d%s (%d lines, win %d)", vim.fn.fnamemodify(abs, ":."),
-    line or 1, first and string.format(" hl %d-%d", first, last or first) or "", n, win)
+  -- Report where the cursor actually landed, not what was asked for: a line
+  -- past EOF is clamped, and the return value is the caller's only confirmation.
+  local clamped = (line and landed ~= line) and string.format(" (clamped from %d)", line) or ""
+  return string.format("%s:%d%s%s (%d lines, win %d)", vim.fn.fnamemodify(abs, ":."),
+    landed, first and string.format(" hl %d-%d", first, last or first) or "", clamped, n, win)
 end
 
 ---Lay files out in vertical columns, left to right, and focus the last one.
 ---Specs are "path", "path:line" or "path:line:first-last".
 ---
----Neo-tree is closed before :only and reopened after: left open it can survive
----as the sole window and swallow the first :edit. `wincmd =` runs before the
----tree returns so the tree keeps its configured width.
+---The file tree is left open and its width restored afterwards. An earlier
+---version closed it, ran :only, and reopened it -- but `Neotree show` is
+---asynchronous, and its deferred callback would try to focus a window :only had
+---already destroyed, raising "Invalid window id" INSIDE a scheduled callback.
+---That surfaces as a `Press ENTER` prompt, which blocks every subsequent socket
+---call and cannot be caught by pcall here. Closing individual windows instead
+---avoids the race entirely.
 function M.columns(...)
   local specs = { ... }
   if #specs == 0 then
@@ -151,12 +160,24 @@ function M.columns(...)
     plan[#plan + 1] = { abs = abs, line = line, first = first, last = last }
   end
 
-  pcall(vim.cmd, "Neotree close")
-  local win = editable_win()
-  if win then
-    vim.api.nvim_set_current_win(win)
+  -- Remember the tree so its width can be restored after `wincmd =`.
+  local tree_win, tree_width
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if vim.bo[vim.api.nvim_win_get_buf(w)].filetype == "neo-tree" then
+      tree_win, tree_width = w, vim.api.nvim_win_get_width(w)
+    end
   end
-  vim.cmd("only")
+
+  local keep = editable_win()
+  if not keep then
+    return "refused: no editable window"
+  end
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if w ~= keep and w ~= tree_win then
+      pcall(vim.api.nvim_win_close, w, false)
+    end
+  end
+  vim.api.nvim_set_current_win(keep)
 
   local out = {}
   for i, p in ipairs(plan) do
@@ -171,8 +192,10 @@ function M.columns(...)
     out[#out + 1] = { win = w, name = vim.fn.fnamemodify(p.abs, ":t") }
   end
   vim.cmd("wincmd =")
+  if tree_win and vim.api.nvim_win_is_valid(tree_win) then
+    pcall(vim.api.nvim_win_set_width, tree_win, tree_width)
+  end
   local focus = out[#out].win
-  pcall(vim.cmd, "Neotree show")
   vim.api.nvim_set_current_win(focus)
 
   local desc = {}
