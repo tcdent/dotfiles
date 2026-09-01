@@ -8,9 +8,7 @@
       "WebSearch"
     ],
     "deny": [],
-    "ask": [
-      "Bash(rm:*)"
-    ],
+    "ask": [],
     "additionalDirectories": [
       "/Users/tcdent/Work/cat"
     ]
@@ -38,6 +36,9 @@
   "promptSuggestionEnabled": false,
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
+  "includeCoAuthoredBy": false,
+  "switchModelsOnFlag": false,
+  "fileCheckpointingEnabled": false,
   "remoteControlAtStartup": true,
   "agentPushNotifEnabled": true
 }
