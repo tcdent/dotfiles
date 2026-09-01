@@ -50,6 +50,11 @@ ln -sf ~/.config/claude/settings.json ~/.claude/settings.json
 - **nvim/** - Neovim config with lazy.nvim, treesitter, LSP (Python, Rust), AI diagnostics
   - `lua/filewatch.lua` - watchman-backed file change events; the single source
     of truth for buffer reloads, the file tree and the diff view
+  - `lua/agent.lua` - integration points for an agent driving the editor over
+    the nvim socket: open a file at a range, lay files out in columns, annotate
+    lines, drive the diff view, read back what is on screen. Called via
+    `bin/agent-nvim`; documented for other agents by the `nvim-editor-control`
+    skill in `agent/skills/`
 - **tmux/** - tmux config with workspaces:
   - `prefix + w` - dev workspace (nvim + 4 shells)
   - `prefix + e` - stats workspace (btop, lazypodman, logs)
@@ -60,6 +65,9 @@ ln -sf ~/.config/claude/settings.json ~/.claude/settings.json
 - **bin/** - Helper scripts:
   - `nvims` - Open file in current nvim session
   - `nvimw` - Same but waits (for git commits)
+  - `agent-nvim` - Call an `agent.lua` integration point in this session's nvim
+    (`agent-nvim --help` lists them); lets an agent show code in the editor
+    rather than pasting it into the terminal
   - `dock` / `undock` - Switch Ghostty settings for external/laptop display
   - `ghostty-reload-config` - Reload Ghostty config
   - `lazypodman` - lazydocker wrapper for Podman
