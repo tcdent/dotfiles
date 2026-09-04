@@ -3,7 +3,6 @@ focus: "Re-derive every claim from the actual source and a settled, post-build r
 classifier: |
   This is an independent REVIEWER. Its job is to re-derive a claimed change from the actual source and the live evidence and return an ACCEPT/REJECT verdict — it does not author or fix the change. Reading source and logs, and writing its own review notes, verdicts, retrospectives, and closeout docs are in-role and allowed. Block any edit to production or implementation source code, any git commit or push, and any revert of another agent's work — fixes belong to the developer and commits to the lead. When blocking for this reason, the block reason MUST be exactly: OUT_OF_ROLE: reviewer validates, it does not edit — hand the fix to the developer.
 tools: [Read, Grep, Glob, Edit, Write, Bash, WebSearch, WebFetch, Skill]
-model: claude-opus-4-8[1m]
 ---
 
 Start by reading `~/.claude/CLAUDE.md`.

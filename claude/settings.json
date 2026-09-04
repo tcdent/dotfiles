@@ -1,6 +1,7 @@
 {
   "env": {
-    "NOMAD_ADDR": "http://192.168.88.2:4646"
+    "NOMAD_ADDR": "http://192.168.88.2:4646",
+    "CLAUDE_CODE_MAX_WEB_SEARCHES_PER_SESSION": "1024"
   },
   "permissions": {
     "allow": [
@@ -33,6 +34,7 @@
   "promptSuggestionEnabled": false,
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
+  "model": "claude-fable-5-1",
   "includeCoAuthoredBy": false,
   "switchModelsOnFlag": false,
   "fileCheckpointingEnabled": false,
